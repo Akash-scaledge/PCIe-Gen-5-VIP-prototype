@@ -1,0 +1,47 @@
+class pcie_dl_pkt_modify_callback extends uvm_callback;
+  `uvm_object_utils(pcie_dl_pkt_modify_callback)
+  int cnt=0;
+  function new(string name = "pcie_dl_pkt_modify_callback");
+    super.new(name);
+  endfunction
+  
+  virtual function void modify_item(ref pcie_dl_seq_item item);
+
+  endfunction
+endclass
+/*
+// callback to corrput lcrc & nack case
+
+class pcie_dl_pkt_modify_callback extends uvm_callback;
+  `uvm_object_utils(pcie_dl_pkt_modify_callback)
+  int cnt = 0;
+  bit lcrc_corrupted = 0;  // Flag to track if we've already corrupted
+  
+  function new(string name = "pcie_dl_pkt_modify_callback");
+    super.new(name);
+  endfunction
+  
+  virtual function void modify_item(ref pcie_dl_seq_item item);
+    // Only corrupt TLPs, not DLLPs
+    if (item.is_tlp) begin
+      cnt++;
+      
+      // Corrupt LCRC for the 8th TLP (seq_num 7)
+      if (cnt == 8 && !lcrc_corrupted) begin
+        // Corrupt the LCRC by flipping some bits
+        item.lcrc = item.lcrc ^ 32'hDEADBEEF;  // XOR with pattern to corrupt
+        lcrc_corrupted = 1;  // Ensure we only corrupt once
+        
+        `uvm_info("CALLBACK", $sformatf("CORRUPTING LCRC for TLP #%0d (seq_num=%0d): Original LCRC='h%h, Corrupted LCRC='h%h", 
+                                        cnt, item.seq_num, item.lcrc ^ 32'hDEADBEEF, item.lcrc), UVM_LOW);
+        
+        // Update the dllp_pkt with corrupted LCRC 
+        if (item.dllp_pkt.size() > 0) begin
+          item.dllp_pkt[item.dllp_pkt.size()-1] = item.lcrc;
+        end
+      end
+    end
+  endfunction
+endclass
+
+*/

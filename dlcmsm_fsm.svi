@@ -1,0 +1,118 @@
+// DLCMSM FSM ...
+`define DLCMSM_GLOBAL_STATE\
+if(cfg_local.device_id)\
+  dlcmsm_ep_state=curr_state;\
+else\
+  dlcmsm_rc_state=curr_state;
+
+class dlcmsm_fsm extends uvm_object;
+  `uvm_object_utils(dlcmsm_fsm)
+  
+  static dlcmsm_state_e curr_state, last_state;
+  int ts1_recvd, ts2_recvd;
+  int ts1_xmitd, ts2_xmitd;
+  static bit go_fc2_state, go_active, go_init;
+  bit timer_started, feature_dllp_received;
+  pcie_dl_cfg cfg_local;
+
+  timer_uvm_dl state_timer;
+  
+  virtual dl_if vif;
+  
+  function new(string name ="dlcmsm_fsm");
+    super.new(name);
+  endfunction
+  
+  //initialize the local variables when the dlcmsm starts
+  function void init(timer_uvm_dl timer, virtual dl_if vif_in, pcie_dl_cfg cfg);
+    //this.parent=parent_in;
+    this.state_timer = timer;
+    this.vif = vif_in;
+    this.curr_state = DL_INACTIVE;
+    this.last_state = DL_INACTIVE;
+    this.timer_started = 0;
+    this.cfg_local=cfg;
+    ts1_recvd = 0;
+    ts2_recvd = 0;
+    ts1_xmitd = 0;
+    ts2_xmitd = 0;
+    go_fc2_state=0;
+  endfunction
+
+  task update_state();
+    //`uvm_info("DLCMSM FSM",$sformatf("state:%0p FSM",curr_state), UVM_NONE)
+    case (curr_state)
+      DL_INACTIVE: begin 
+        if (!timer_started) begin
+          state_timer.start_timer(LTSSM_12MS, cfg_local.name);        
+          timer_started = 1;
+        end
+
+        @(posedge vif.clk);
+        wait(state_timer.done_flag);
+        if (cfg_local.dl_feature_exchange_enable) begin
+          curr_state = DL_FEATURE;
+        end
+        else begin
+          curr_state = DL_INIT; // Legacy path
+        end
+        last_state = DL_INACTIVE;
+        timer_started = 0;
+        `DLCMSM_GLOBAL_STATE
+      end
+      
+      // NEW STATE implementation
+      DL_FEATURE: begin
+        if (go_init) begin
+          curr_state = DL_INIT;
+          last_state = DL_FEATURE;
+          `DLCMSM_GLOBAL_STATE
+          `uvm_info("FSM", $sformatf("Conditions met in DL_FEATURE moving to  %s state", curr_state.name()), UVM_LOW)     
+        end
+      end
+//                  cfg_local.remote_hdr_scale = rx_feature_dllp.hdr_scale;
+//            cfg_local.remote_data_scale = rx_feature_dllp.data_scale;
+//            cfg_local.feature_exchange_done = 1;
+      
+      DL_INIT: begin 
+        //`uvm_info("FSM", $sformatf("Transitioning from %s to %s state", last_state.name(), curr_state.name()), UVM_LOW)
+        if (!timer_started) begin
+          state_timer.start_timer(LTSSM_2MS, cfg_local.name);
+          timer_started = 1;
+        end
+        wait(state_timer.done_flag);
+        curr_state = FC_INIT1;
+        last_state = DL_INIT;
+        timer_started = 0;
+        `DLCMSM_GLOBAL_STATE
+      end
+      
+      FC_INIT1: begin
+        //`uvm_info("FSM", $sformatf("Transitioning from %s to %s state", last_state.name(), curr_state.name()), UVM_LOW)     
+        if (go_fc2_state) begin
+          curr_state = FC_INIT2;
+          last_state = FC_INIT1;
+          `DLCMSM_GLOBAL_STATE
+          `uvm_info("FSM", $sformatf("Conditions met in FC_INIT1 moving to  %s state", curr_state.name()), UVM_LOW)     
+        end
+      end
+      
+      FC_INIT2: begin
+        //`uvm_info("FSM", $sformatf("Transitioning from %s to %s state", last_state.name(), curr_state.name()), UVM_LOW) 
+        if (go_active) begin
+          curr_state = DL_ACTIVE;
+          last_state = FC_INIT2;
+          `uvm_info("FSM", $sformatf("Conditions met in FC_INIT2 moving to  %s state", curr_state.name()), UVM_LOW) 
+          `DLCMSM_GLOBAL_STATE
+        end
+      end
+      
+      DL_ACTIVE: begin
+//         `uvm_info("FSM", $sformatf("Transitioned from %s to %s state", last_state.name(), curr_state.name()), UVM_LOW) 
+      end
+      
+      
+      
+    endcase
+  endtask
+endclass
