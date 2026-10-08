@@ -37,7 +37,7 @@ class siv_ltssm_seq extends uvm_sequence #(siv_ltssm_seq_item);
   task body();
     siv_ltssm_seq_item req;
 
-    while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+    while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
       if (pl_cfg.is_rc) begin
         case (ltssm_rc_state)
@@ -543,7 +543,7 @@ class siv_Config_lanenum_Accept_to_Config_Compl_Seq extends siv_ltssm_seq;
                 task body();
                   siv_ltssm_seq_item req;
 
-                  while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+                  while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
                     if (pl_cfg.is_rc) begin
                       case (ltssm_rc_state)
@@ -722,7 +722,7 @@ class siv_Config_lanenum_Accept_to_Detect_Seq extends siv_ltssm_seq;
                 task body();
                   siv_ltssm_seq_item req;
 
-                  while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+                  while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
                     if (pl_cfg.is_rc) begin
                       case (ltssm_rc_state)
@@ -875,7 +875,7 @@ class siv_ltssm_seq_eq_mode extends siv_ltssm_seq;
   task body();
     siv_ltssm_seq_item req;
 
-    while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+    while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
       if (pl_cfg.is_rc) begin
         case (ltssm_rc_state)
@@ -1572,7 +1572,7 @@ endclass
   task body();
     siv_ltssm_seq_item req;
 
-    while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+    while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
       if (pl_cfg.is_rc) begin
         case (ltssm_rc_state)
@@ -2006,7 +2006,7 @@ class siv_ltssm_seq_speeed_change_32GT extends siv_ltssm_seq;
   task body();
     siv_ltssm_seq_item req;
 
-    while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+    while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
       if (pl_cfg.is_rc) begin
         case (ltssm_rc_state)
