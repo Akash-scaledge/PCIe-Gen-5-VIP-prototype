@@ -8,8 +8,8 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
   siv_ltssm_fsm              state_machine;
   siv_uvm_timer_pl              state_timer;
   siv_ltssm_pl_cfg           pl_cfg=new();
-  uvm_blocking_put_port #(global_que_t) pl_sending_dl_port;
-  uvm_blocking_get_port #(global_que_t) pl_rcv_dl_port;
+  uvm_blocking_put_port #(dw_pkt) pl_sending_dl_port;
+  uvm_blocking_get_port #(dw_pkt) pl_rcv_dl_port;
 
   global_que_t  pkt_from_dl;
   global_que_t  pkt_from_dl_stored[$];
@@ -228,7 +228,8 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
 //--------------------------------------
   task collect_from_dl();
     forever begin
-      pl_rcv_dl_port.get(pkt_from_dl);
+//       pl_rcv_dl_port.get(pkt_from_dl);
+      dw_pkt::get_q(pl_rcv_dl_port, pkt_from_dl);
       pkt_from_dl_stored.push_back(pkt_from_dl);
       `uvm_info("PL_RCV_DL_PKT",$sformatf("RECIEVED SUCCESS PKT:/n %p",pkt_from_dl_stored),UVM_LOW)
 
@@ -845,7 +846,8 @@ endtask
                     $sformatf(" 32 bit dllp que sendig to dl  %p",gbl),
                     UVM_NONE)
           
-          pl_sending_dl_port.put(gbl);
+//           pl_sending_dl_port.put(gbl);
+          dw_pkt::put_q(pl_sending_dl_port, gbl);
           gbl.delete();
           temp_que.delete();
         end
@@ -869,7 +871,8 @@ endtask
                     $sformatf(" 32 bit Tlp que sendig to dl  %p",gbl),
                     UVM_NONE)
           
-          pl_sending_dl_port.put(gbl);
+//           pl_sending_dl_port.put(gbl);
+          dw_pkt::put_q(pl_sending_dl_port, gbl);
           gbl.delete();
           temp_que.delete();
         end

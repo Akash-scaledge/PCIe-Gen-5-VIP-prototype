@@ -26,10 +26,10 @@ class siv_pcie_device_agent extends uvm_agent;
   // ------------------------------------------------------------
   // Internal FIFOs between layers
   // ------------------------------------------------------------
-  uvm_tlm_fifo #(global_que_t) tl_2_dl_fifo;
-  uvm_tlm_fifo #(global_que_t) dl_2_tl_fifo;
-  uvm_tlm_fifo #(global_que_t) dl_2_pl_fifo;
-  uvm_tlm_fifo #(global_que_t) pl_2_dl_fifo;
+  uvm_tlm_fifo #(dw_pkt) tl_2_dl_fifo;
+  uvm_tlm_fifo #(dw_pkt) dl_2_tl_fifo;
+  uvm_tlm_fifo #(dw_pkt) dl_2_pl_fifo;
+  uvm_tlm_fifo #(dw_pkt) pl_2_dl_fifo;
 
   // ------------------------------------------------------------
   // Constructor

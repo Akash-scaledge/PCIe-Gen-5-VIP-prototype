@@ -37,6 +37,23 @@ import uvm_pkg::*;
 // Common typedefs / globals
 //======================================================
 typedef bit [31:0] global_que_t[$];
+class dw_pkt extends uvm_object;
+  `uvm_object_utils(dw_pkt)
+  bit [31:0] dw[$];
+  function new(string name = "dw_pkt"); super.new(name); endfunction
+
+  static task put_q(uvm_blocking_put_port #(dw_pkt) port, input global_que_t q);
+    dw_pkt p = new();
+    p.dw = q;
+    port.put(p);
+  endtask
+
+  static task get_q(uvm_blocking_get_port #(dw_pkt) port, output global_que_t q);
+    dw_pkt p;
+    port.get(p);
+    q = p.dw;
+  endtask
+endclass
 
 //======================================================
 // Common parameters / timers
