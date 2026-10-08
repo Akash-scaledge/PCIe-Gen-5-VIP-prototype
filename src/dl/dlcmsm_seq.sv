@@ -58,27 +58,20 @@ class dlcmsm_seq extends uvm_sequence #(pcie_dl_seq_item);
                         })
     end
     wait(cfg.curr_state == DL_ACTIVE);
+    // TLPs are now sent by the DL driver straight from the Transaction Layer
+    // queue (see dlcmsm_driver::dlcmsm_tx), so this sequence only sends
+    // UpdateFC DLLPs. It no longer sends "TLP slot" items and no longer
+    // synchronises RC and EP through static flags.
     for (int i = 0; i < `NUM_TLPS_TO_SEND; i++) begin
-          foreach (updatefc_ordered_types[i]) begin
-            `uvm_do_with(req, { req.dllps_pkt.dllp_type == updatefc_ordered_types[i]; req.is_tlp == 0;req.acknak_pkt.dllp_type == 0;
+          foreach (updatefc_ordered_types[j]) begin
+            `uvm_do_with(req, { req.dllps_pkt.dllp_type == updatefc_ordered_types[j]; req.is_tlp == 0;req.acknak_pkt.dllp_type == 0;
                               req.dllps_pkt.HdrFC == my_hdr_limit;
                          req.dllps_pkt.DataFC == my_data_limit;
                               req.tlps_pkt.length inside {[1:32]};
                               })
-            $display("triggered %t",$realtime);
           end
-      current_seq = shared_seq_num;
-      repeat(2)
-      `uvm_do_with(req, { req.is_tlp == 1; req.seq_num == current_seq; })
-      tlp_sent_flags[cfg.device_id] = 1;
-      if (cfg.device_id == 1) begin
-        wait (tlp_sent_flags == 2'b11);
-        shared_seq_num++;
-        tlp_sent_flags = 2'b00;
-      end
       my_hdr_limit = (my_hdr_limit + 1) % 256; 
       my_data_limit = (my_data_limit + 8) % 4096;
-      wait (tlp_sent_flags[cfg.device_id] == 0);
     end
   endtask
 
