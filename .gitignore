@@ -13,3 +13,6 @@ verdiLog/
 work/
 transcript
 qrun.out/
+*.swp
+*.swo
+.nfs*
