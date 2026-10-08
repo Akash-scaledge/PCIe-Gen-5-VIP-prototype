@@ -1,0 +1,15 @@
+sim/out/
+csrc/
+simv*
+*.daidir/
+*.vpd
+*.fsdb
+*.vcd
+*.log
+ucli.key
+vc_hdrs.h
+novas*
+verdiLog/
+work/
+transcript
+qrun.out/
