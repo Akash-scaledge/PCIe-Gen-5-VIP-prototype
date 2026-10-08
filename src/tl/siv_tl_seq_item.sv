@@ -491,8 +491,8 @@ class siv_pcie_tl_sequence_items extends uvm_sequence_item;
     (header_msg.msg_code==MSG_PTM_RESP)->(header_msg.len==2);
     (header_msg.msg_code==MSG_SET_SLOT_LIMIT)->(header_msg.len==1);
     (header_msg.msg_code==MSG_PTM_RESP && header_msg.fmt==3)->(header_msg.len==1);
-    soft (header_msg.msg_code==MSG_VDM_TYPE0 && header_msg.fmt==3)->(header_msg.len==1);
-    soft (header_msg.msg_code==MSG_VDM_TYPE1 && header_msg.fmt==3)->(header_msg.len==1);
+    (header_msg.msg_code==MSG_VDM_TYPE0 && header_msg.fmt==3)->soft (header_msg.len==1);
+    (header_msg.msg_code==MSG_VDM_TYPE1 && header_msg.fmt==3)->soft (header_msg.len==1);
   }
   
   
