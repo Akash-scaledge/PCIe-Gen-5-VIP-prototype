@@ -112,8 +112,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
   global_que_t tl_rc_getting_que;
   global_que_t dl_ep_sending_que;
   global_que_t tl_ep_getting_que;
-  uvm_blocking_put_port #(global_que_t) tl_driver_dl_put_port;
-  uvm_blocking_get_port #(global_que_t) tl_driver_dl_get_port;
+  uvm_blocking_put_port #(dw_pkt) tl_driver_dl_put_port;
+  uvm_blocking_get_port #(dw_pkt) tl_driver_dl_get_port;
   //
 
   global_que_t dl_rcv_data;
@@ -229,7 +229,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
         else if(req.pkt_type==3) dl_rc_sending_que=req.TLP_i;
         else if(req.pkt_type==5) dl_rc_sending_que=req.TLP_msg;
 //         if(vif.rst == 0);
-        tl_driver_dl_put_port.put(dl_rc_sending_que);
+//         tl_driver_dl_put_port.put(dl_rc_sending_que);
+        dw_pkt::put_q(tl_driver_dl_put_port, dl_rc_sending_que);
         // Drives actual signals
         //it is blocking to send next pkt
         `uvm_info("here0","here",UVM_NONE)
@@ -381,7 +382,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
           begin
             tl_ep_getting_que.delete();
             //             @(posedge vif.clk);
-            tl_driver_dl_get_port.get(tl_ep_getting_que);
+            dw_pkt::get_q(tl_driver_dl_get_port, tl_ep_getting_que);
+//             tl_driver_dl_get_port.get(tl_ep_getting_que);
             `uvm_info("RECIEVED DATA FROM DL",$sformatf("DATA = %p",tl_ep_getting_que),UVM_NONE)
 
             // **MINIMAL TC-VC ADDITION**: Pre-process TC-VC mapping for received packets
@@ -390,7 +392,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
                 tc_vc_map();
               end
             `uvm_info("max run line",$sformatf("size %0d  ep_getting=%p",tl_ep_getting_que.size,tl_ep_getting_que),UVM_NONE)
-            `uvm_info(get_full_name(),$sformatf("%h",tl_ep_getting_que),UVM_NONE);
+//             `uvm_info(get_full_name(),$sformatf("%h",tl_ep_getting_que),UVM_NONE);
+            `uvm_info(get_full_name(),$sformatf("%p",tl_ep_getting_que),UVM_NONE);
             // Logic to receive config packet
             if (tl_ep_getting_que[0][28:24] == 4)
               begin // if the pkt is config then only it need to enter the loop
@@ -570,7 +573,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
           //           if(vif.rx_data!=0)
             begin
               `uvm_info("flag","pass2",UVM_NONE)
-              tl_driver_dl_get_port.get(tl_rc_getting_que);
+              dw_pkt::get_q(tl_driver_dl_get_port, tl_rc_getting_que);
+//               tl_driver_dl_get_port.get(tl_rc_getting_que);
               `uvm_info("INSIDE TL DRIVER",$sformatf("The RC Got the completion=%p",tl_rc_getting_que),UVM_NONE)
 
               rx_cpl_pkt.push_back(vif.rx_data); // tl_ep_getting_que in this queue, storing the rx_data
@@ -1377,7 +1381,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
         else TLP_comp_pkt = {>>int{headerQ_comp,payload_c}};
       end
       dl_ep_sending_que= TLP_comp_pkt;
-      tl_driver_dl_put_port.put(dl_ep_sending_que);
+//       tl_driver_dl_put_port.put(dl_ep_sending_que);
+      dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
 
       `uvm_info(get_type_name(), $sformatf("Config completion formed for VC%0d (TC%0d)", response_vc, tc), UVM_LOW)
       //Ends here
@@ -1485,7 +1490,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
           else if(td==1 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp,ecrc}};//added
           else if(td==0 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp}};//added
           dl_ep_sending_que= TLP_comp_pkt;
-          tl_driver_dl_put_port.put(dl_ep_sending_que);
+//           tl_driver_dl_put_port.put(dl_ep_sending_que);
+          dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
           `uvm_info("completion pkt",$psprintf("####################TLP_comp_pkt=%p###########################",TLP_comp_pkt),UVM_LOW)
           drive_mem_comp();          
         end
@@ -1518,7 +1524,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
             else if(td==1 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp,ecrc}};//added
             else if(td==0 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp}};//added
             dl_ep_sending_que= TLP_comp_pkt;
-            tl_driver_dl_put_port.put(dl_ep_sending_que);
+//             tl_driver_dl_put_port.put(dl_ep_sending_que);
+            dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
             `uvm_info("EP SIDE TLP_comp_pkt", $psprintf("###############TLP_comp_pkt=%p########################",TLP_comp_pkt),UVM_LOW)
             `uvm_info("TLP MEM COMP",$psprintf("  TLP_confg_comp=%p",TLP_comp_pkt),UVM_FULL)
             /*  for (int k=0;k<TLP_comp_pkt.size();k++)begin
@@ -1554,7 +1561,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
             if(td==1 && fmt==2)TLP_comp_pkt={>>int{headerQ_comp,payload_m,ecrc}};
             else if(td==0 && fmt==2) TLP_comp_pkt={>>int{headerQ_comp,payload_m}};
             dl_ep_sending_que= TLP_comp_pkt;
-            tl_driver_dl_put_port.put(dl_ep_sending_que);
+//             tl_driver_dl_put_port.put(dl_ep_sending_que);
+            dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
             `uvm_info(get_type_name(), $sformatf("Memory completion formed for VC%0d (TC%0d)", response_vc, tc), UVM_LOW)
 
             `uvm_info("TLP MEM COMP",$psprintf("  TLP_comp_pkt=%p",TLP_comp_pkt_1),UVM_FULL)
@@ -1597,7 +1605,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
           else if(td==1 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp,ecrc}};//added
           else if(td==0 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp}};//added
           dl_ep_sending_que= TLP_comp_pkt;
-          tl_driver_dl_put_port.put(dl_ep_sending_que);
+//           tl_driver_dl_put_port.put(dl_ep_sending_que);
+          dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
 
           `uvm_info("completion pkt",$psprintf("####################TLP_comp_pkt=%p###########################",TLP_comp_pkt),UVM_LOW)
           drive_mem_comp();
@@ -1631,7 +1640,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
             else if(td==1 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp,ecrc}};//added
             else if(td==0 && fmt==0)TLP_comp_pkt={>>int{headerQ_comp}};//added
             dl_ep_sending_que= TLP_comp_pkt;
-            tl_driver_dl_put_port.put(dl_ep_sending_que);
+//             tl_driver_dl_put_port.put(dl_ep_sending_que);
+            dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
             `uvm_info("EP SIDE TLP_comp_pkt", $psprintf("###############TLP_comp_pkt=%p########################",TLP_comp_pkt),UVM_LOW)
             `uvm_info("TLP MEM COMP",$psprintf("  TLP_confg_comp=%p",TLP_comp_pkt),UVM_FULL)
             /*  for (int k=0;k<TLP_comp_pkt.size();k++)begin
@@ -1667,7 +1677,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
             if(td==1 && fmt==2)TLP_comp_pkt={>>int{headerQ_comp,payload_m,ecrc}};
             else if(td==0 && fmt==2) TLP_comp_pkt={>>int{headerQ_comp,payload_m}};
             dl_ep_sending_que= TLP_comp_pkt;
-            tl_driver_dl_put_port.put(dl_ep_sending_que);
+//             tl_driver_dl_put_port.put(dl_ep_sending_que);
+            dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
             `uvm_info("TLP MEM COMP",$psprintf("  TLP_comp_pkt=%p",TLP_comp_pkt_1),UVM_FULL)
             /*  for (int k=0;k<TLP_comp_pkt_1.size();k++)begin
               TLP_storage.push_back(TLP_comp_pkt[k]);
@@ -1715,7 +1726,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
         TLP_comp_pkt = {>>int{headerQ_comp}};
       end
       dl_ep_sending_que= TLP_comp_pkt;
-      tl_driver_dl_put_port.put(dl_ep_sending_que);
+//       tl_driver_dl_put_port.put(dl_ep_sending_que);
+      dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
       //-------------------------------------------ANANDITA----------------------------------------------------------
 
 
@@ -1754,7 +1766,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
       end
       //-------------------------------------------ANANDITA----------------------------------------------------------
       dl_ep_sending_que= TLP_comp_pkt;
-      tl_driver_dl_put_port.put(dl_ep_sending_que);
+//       tl_driver_dl_put_port.put(dl_ep_sending_que);
+      dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
       `uvm_info(get_type_name(), $sformatf("IO Read completion formed for VC%0d (TC%0d)", response_vc, tc), UVM_LOW)
     end
     else if(typef inside {12,13,14} && fmt == 2 || fmt == 3) begin//add

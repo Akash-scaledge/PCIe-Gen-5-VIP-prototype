@@ -83,10 +83,10 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   bit [11:0] last_ackd_seq = 12'hFFF;     // Track last ACK/NAK sequence
 
   //Get port declared here only
-  uvm_blocking_get_port #(global_que_t) dl_driver_get_tl_port;
-  uvm_blocking_put_port #(global_que_t) dl_driver_put_tl_port;
-  uvm_blocking_put_port #(global_que_t) dl_sending_pl_port;
-  uvm_blocking_get_port #(global_que_t) dl_rcv_pl_port;
+  uvm_blocking_get_port #(dw_pkt) dl_driver_get_tl_port;
+  uvm_blocking_put_port #(dw_pkt) dl_driver_put_tl_port;
+  uvm_blocking_put_port #(dw_pkt) dl_sending_pl_port;
+  uvm_blocking_get_port #(dw_pkt) dl_rcv_pl_port;
 
 
   // UVM TLM FIFO for ACK/NAK requests 
@@ -339,7 +339,8 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
       if(fsm.curr_state != DL_FEATURE) begin
         break; 
       end
-      dl_rcv_pl_port.get(dl_frm_pl_q);
+//       dl_rcv_pl_port.get(dl_frm_pl_q);
+      dw_pkt::get_q(dl_rcv_pl_port, dl_frm_pl_q);
 
       // Create RX transaction container
       rx_item = pcie_dl_seq_item::type_id::create("rx_item", this);
@@ -568,7 +569,8 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
       //         `uvm_info("COLLECTION_TL_2_DL",$sformatf("DROPING RC::%0b",cfg.device_id==0),UVM_NONE);
       //       end
 
-      dl_driver_get_tl_port.get(dl_getting_que);
+      dw_pkt::get_q(dl_driver_get_tl_port, dl_getting_que);
+//       dl_driver_get_tl_port.get(dl_getting_que);
       rcv_flag=1;
       //       if(cntr==0)begin
       //         phase.raise_objection(this);
@@ -781,7 +783,9 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
         req.tlps_pkt.sdw=		dl_q[1];
         req.tlps_pkt.Address=	dl_q[2];
         //         req.payload.delete();
-        req.payload=new[dl_q.size()-3](dl_q[3:$]);
+//         req.payload=new[dl_q.size()-3](dl_q[3:$]);
+        req.payload = new[dl_q.size()-3];
+        foreach (req.payload[i]) req.payload[i] = dl_q[i+3];
 //         $display("################################################################");
 //         $display("%p",req.tlps_pkt);
         req.from_TL=1;
@@ -913,7 +917,8 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
 //       foreach(req.dllp_pkt[i])
 //         $display("%h ",req.dllp_pkt[i]);
     end
-    dl_sending_pl_port.put(req.dllp_pkt);
+//     dl_sending_pl_port.put(req.dllp_pkt);
+    dw_pkt::put_q(dl_sending_pl_port, req.dllp_pkt);
       `uvm_info(get_full_name(),$sformatf("RC::%0b TLP_NO::%0d Dl_DONE:: %p\tIS_TLP::%0b  ::IDENTIFIER::%0h  from_TL::%0b", (cfg.device_id==0),cntr_tlp,req.dllp_pkt,req.is_tlp,req.dllp_pkt[0],req.from_TL),UVM_NONE);
 
   endtask
@@ -939,7 +944,8 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     forever begin
       rx_item = pcie_dl_seq_item::type_id::create("rx_item", this);
       rx_item.device_id = cfg.device_id;
-      dl_rcv_pl_port.get(dl_frm_pl_q);
+      dw_pkt::get_q(dl_rcv_pl_port, dl_frm_pl_q);
+//       dl_rcv_pl_port.get(dl_frm_pl_q);
       //       @(posedge vif.clk);
       rx_dword = dl_frm_pl_q[0];
 
@@ -1003,7 +1009,8 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
               last_good_seq_num_to_ack = received_seq;
               next_rcv_seq = (next_rcv_seq + 1) % 4096;
               nak_scheduled = 0;
-              dl_driver_put_tl_port.put(dl_frm_pl_q[2:dl_frm_pl_q.size()-2]);
+              dw_pkt::put_q(dl_driver_put_tl_port, dl_frm_pl_q[2:dl_frm_pl_q.size()-2]);
+//               dl_driver_put_tl_port.put(dl_frm_pl_q[2:dl_frm_pl_q.size()-2]);
               `uvm_info("DL_2_TL",$sformatf("TLP 2 DL SENT SUCESS=%p",dl_frm_pl_q[2:dl_frm_pl_q.size()-2]),UVM_NONE);
 
               if (!ack_timer_running) begin
