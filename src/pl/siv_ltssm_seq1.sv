@@ -28,7 +28,7 @@ class Corrupt_ts1_to_ts2_polling_active_seq extends siv_ltssm_seq;
   task body();
     siv_ltssm_seq_item req;
 
-    while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+    while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
       if (pl_cfg.is_rc) begin
         case (ltssm_rc_state)
@@ -460,7 +460,7 @@ class reject_coeff_seq extends siv_ltssm_seq;
   task body();
     siv_ltssm_seq_item req;
 
-    while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+    while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
 
       if (pl_cfg.is_rc) begin
         case (ltssm_rc_state)
@@ -897,7 +897,7 @@ class siv_ltssm_seq_L0s extends uvm_sequence #(siv_ltssm_seq_item);
   task body();
     siv_ltssm_seq_item req;
 
-//     while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+//     while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
      while ((pl_cfg.is_rc ) || (!pl_cfg.is_rc)) begin
 
       if (pl_cfg.is_rc) begin
@@ -1442,7 +1442,7 @@ class siv_ltssm_seq_L1 extends uvm_sequence #(siv_ltssm_seq_item);
   task body();
     siv_ltssm_seq_item req;
 
-//     while ((pl_cfg.is_rc && ltssm_rc_state != L0) || (!pl_cfg.is_rc && ltssm_ep_state != L0)) begin
+//     while ((pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_rc_state)) || (!pl_cfg.is_rc && !`SIV_LINK_UP(ltssm_ep_state))) begin
      while ((pl_cfg.is_rc ) || (!pl_cfg.is_rc)) begin
 
       if (pl_cfg.is_rc) begin

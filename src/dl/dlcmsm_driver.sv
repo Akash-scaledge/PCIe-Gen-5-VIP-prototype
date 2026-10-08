@@ -192,9 +192,9 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   task run_phase(uvm_phase phase);
     //     phase.raise_objection(this);
     if(cfg.device_id==0)
-      wait(ltssm_rc_state==L0);
+      wait(`SIV_LINK_UP(ltssm_rc_state));
     else
-      wait(ltssm_ep_state==L0);      
+      wait(`SIV_LINK_UP(ltssm_ep_state));      
     `uvm_info(get_type_name(),"################# ENTERED DL DRIVER AFTER L0 ##########################",UVM_NONE);
     // Sanity check for virtual interface
     if (vif == null)

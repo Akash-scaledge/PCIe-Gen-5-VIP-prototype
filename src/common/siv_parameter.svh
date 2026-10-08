@@ -138,6 +138,12 @@ bit      equalization_done_16GT_data_rate;
 bit      equalization_done_32GT_data_rate;
 bit      start_equalization_w_preset;
 
+// Link is really up: in L0 AND no speed change pending.
+// Same condition the LTSSM FSM uses in its L0 state (siv_ltssm_fsm.sv, L0 case).
+// Without the speed-change check, sequences/DL can see the 1-timestep L0 that
+// happens right before the L0 -> Recovery speed change and stop/start too early.
+`define SIV_LINK_UP(st) (((st) == L0) && !(com_data_rate > `SPEED_2_5_GTS && cur_data_rate != com_data_rate))
+
 //OS SENT STATUS
 bit fts_sent=0;
 bit eie_sent=0;

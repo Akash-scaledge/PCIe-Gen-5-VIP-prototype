@@ -9,4 +9,4 @@ vcs -full64 -sverilog -timescale=1ns/1ps -debug_access+all -kdb \
     +incdir+$UVM_HOME/src $UVM_HOME/src/dpi/uvm_dpi.cc -CFLAGS -DVCS \
     -f sim/vip.f -o sim/out/simv -l sim/out/compile.log
 ./sim/out/simv +UVM_TESTNAME=$TEST +UVM_VERBOSITY=UVM_MEDIUM \
-    +UVM_TIMEOUT=2000000000,NO -l sim/out/run.log
+    +UVM_TIMEOUT=20000000,NO -l sim/out/run.log
