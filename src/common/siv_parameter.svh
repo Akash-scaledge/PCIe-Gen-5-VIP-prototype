@@ -122,6 +122,15 @@ typedef enum {
 
 ltssm_state_e ltssm_rc_state,ltssm_ep_state;
 
+// DL <-> PL power-management handshake for L1 entry (index 0 = RC, 1 = EP)
+//   dl_pm_l1_req[i] : set by the test / PL to make device i's DL start L1 entry
+//                     (stop TLPs, wait for ACKs, send PM request DLLPs)
+//   dl_pm_l1_go[i]  : set by device i's DL when PM_Request_Ack is received;
+//                     the PL may then send EIOS and go to L1. Cleared by the
+//                     DL when the link is back in L0.
+bit dl_pm_l1_req[2];
+bit dl_pm_l1_go[2];
+
 //Global Variables
 bit      directed_speed_change=1;
 bit[4:0] original_data_rate;

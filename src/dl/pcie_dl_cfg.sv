@@ -22,6 +22,11 @@ class pcie_dl_cfg extends uvm_object;
   dlcmsm_state_e curr_state;
   dlcmsm_state_e last_state;
   int device_id = 0; // Add device identifier for replay buffer separation
+
+  // PM L1 entry (see dlcmsm_driver::pm_l1_manager)
+  bit pm_l1_accept          = 1;   // responder accepts a PM L1 request (sends PM_Request_Ack)
+  bit pm_l1_use_pci_pm      = 0;   // requester: 0 = ASPM (PM_Active_State_Request_L1), 1 = PCI-PM (PM_Enter_L1)
+  int pm_dllp_resend_cycles = 32;  // PM request / PM_Request_Ack DLLP repeated every N clocks
   
   `uvm_object_utils_begin(pcie_dl_cfg)
     `uvm_field_int(is_rc, UVM_ALL_ON)
