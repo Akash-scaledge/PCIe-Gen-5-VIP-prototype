@@ -151,6 +151,14 @@ endclass
 `include "siv_pcie_base_test.sv"
 
 //======================================================
+// Data Link Layer tests (tests/dl)
+//======================================================
+`include "dl_test_lib.svh"
+`include "dl_tests_akash.svh"
+`include "dl_tests_bhabagrahi.svh"
+`include "dl_tests_mayank.svh"
+
+//======================================================
 // Unified Tests ONLY (NO separate PL/DL/TL tests)
 //======================================================
 
