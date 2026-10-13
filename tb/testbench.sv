@@ -93,6 +93,7 @@ endclass
 `include "siv_ltssm_fsm.sv"
 `include "siv_ltssm_seq.sv"
 `include "siv_ltssm_seq1.sv"
+`include "siv_ltssm_seq2.sv"
 `include "siv_ltssm_sequencer.sv"
 `include "siv_ltssm_driver.sv"
 `include "siv_ltssm_cov.sv"

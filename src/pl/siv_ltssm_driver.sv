@@ -179,7 +179,8 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
 
       state_timer = siv_uvm_timer_pl::type_id::create("state_timer", this);
     state_timer.set_vif(pl_intf);
-    state_machine = new();
+    //state_machine = siv_ltssm_fsm ::type_id::create("state_machine", this);
+    state_machine=new();
   endfunction
 
 
@@ -191,7 +192,7 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
       forever begin
         @state_machine.current_state;       
         `uvm_info(get_type_name(), 
-                  $sformatf("State change: %s -> %s", 
+                  $sformatf("State change: %s -->> %s", 
                             state_machine.previous_state, 
                             state_machine.current_state), 
                   UVM_MEDIUM)
@@ -300,7 +301,7 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
         L0S_IDLE,
         L0S_FTS,
         L1_IDLE,
-        L1_ENTRY,
+        L1_ENTRY,L2_IDLE,L2_TRANSMITWAKE,
         RECOVERY_RCVRLOCK,
         RECOVERY_RCFG,
         RECOVERY_EQUALIZATION_PHASE_0,  // New state
@@ -423,7 +424,7 @@ task ltssm_rx();
                               pl_cfg.inst_name,
                               state_machine.eios_rcvd_cnt),
                     UVM_MEDIUM)
-          is_eios = 0;
+          is_eios = 0; symbol_count=0;
         end
         else if (is_fts &&
                  (os_buffer[0] == 8'h55 && os_buffer[15] == 8'h55)) begin
@@ -709,7 +710,7 @@ endtask
         end
       end
 
-      L0S_IDLE,
+      L0S_IDLE,L2_TRANSMITWAKE,
       L1_IDLE: begin
         if(req.ts_type==OS_EIE) begin
           tran_eieos_os(req,"EIEOS");

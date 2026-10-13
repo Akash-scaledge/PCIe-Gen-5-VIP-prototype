@@ -117,59 +117,13 @@ class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
               end
             
           end
-          
-//           L0S_ENTRY: begin
-//             `uvm_do_with(req, { ts_type == OS_EIOS; })
-//             `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent EIOS OS IN L0S_ENTRY"), UVM_MEDIUM)
-//           end
-          
-//           L0S_IDLE: begin
-//           `uvm_do_with(req, { ts_type == OS_EIE; })
-//             `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent EIEOS (00h,11h) OS IN L0S_IDLE"), UVM_MEDIUM)
-//           end
-         
-//           L0S_FTS: begin
-//             if(!eie_sent) begin
-//               $display("cur_data_rate=%b",cur_data_rate);
-//               `uvm_do_with(req, { ts_type == OS_EIE; })
-//               `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent EIE OS in L0S_FTS EIE_sent=%0d",eie_sent), UVM_MEDIUM)
-//             end
-       
-//             if (fts_sent) begin 
-//               $display("%0b",cur_data_rate);
-//        `uvm_do_with(req, { ts_type == (cur_data_rate inside {`SPEED_2_5_GTS, `SPEED_5_GTS} ? OS_SKP : OS_SDS); })
-//               `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent #### %s OS", cur_data_rate inside {`SPEED_2_5_GTS, `SPEED_5_GTS} ? "SKP" : "SDS"), UVM_LOW) 
-//              pl_cfg.l0s_entry_enable=0;    pl_cfg.aspm_l0s_support=0;
-//             end
-//             if ( eie_sent && !fts_sent)
-//               begin
-//                 `uvm_do_with(req, { ts_type == OS_FTS;})
-//                 `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent FTS OS in L0S_FTS fts_sent=%0d",fts_sent), UVM_MEDIUM)
-                
-//               end
-//           end
-          
-//          L1_ENTRY: begin
-//             `uvm_do_with(req, { ts_type == OS_EIOS; })
-//            `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent EIOS OS IN L1_ENTRY"), UVM_MEDIUM)
-//           end
-          
-//          L1_IDLE: begin
-//           `uvm_do_with(req, { ts_type == OS_EIE; })
-//            `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent EIEOS (00h,11h) OS IN L1_IDLE"), UVM_MEDIUM)
-//               pl_cfg.l1_entry_enable=0;    pl_cfg.aspm_l1_support=0;
-//           end
-            L2_IDLE: begin
+          L2_IDLE: begin
             pl_cfg.l2_entry_enable=0;
-               `uvm_do_with(req, { ts_type == OS_EIE; })
-            //`uvm_info("SIV_PCIE_SEQ", $sformatf("RC:  in L2_IDLE "), UVM_MEDIUM)
+               wait(pl_cfg.beacon_detected);
+            `uvm_info("SIV_PCIE_SEQ", $sformatf("RC:  in L2_IDLE "), UVM_MEDIUM)
           end
           
-          L2_TRANSMITWAKE: begin
-         
-            `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: IN L2_TRANSMITWAKE"), UVM_MEDIUM)
-          end
-           
+                    
           // For RC in RECOVERY_RCVRLOCK
           RECOVERY_RCVRLOCK: begin
             `uvm_do_with(req, {
@@ -366,59 +320,22 @@ class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
            L0: begin
              if(pl_cfg.l2_entry_enable ) begin
               `uvm_do_with(req, { ts_type == OS_EIOS; })
-              `uvm_info("SIV_PCIE_SEQ", $sformatf("RC: Sent EIOS OS IN L0"), UVM_MEDIUM)
+              `uvm_info("SIV_PCIE_SEQ", $sformatf("EP: Sent EIOS OS IN L0"), UVM_MEDIUM)
             end
               else
               begin 
-                `uvm_info("SIV_PCIE_SEQ", $sformatf("RC is in L0 active state"), UVM_MEDIUM) 
+                `uvm_info("SIV_PCIE_SEQ", $sformatf("EP is in L0 active state"), UVM_MEDIUM) 
                 break;
               end
            end
           
-//           L0S_ENTRY: begin
-//             `uvm_do_with(req, { ts_type == OS_EIOS; })
-//             `uvm_info("SIV_PCIE_SEQ", $sformatf("EP: Sent EIOS OS IN L0S_ENTRY"), UVM_MEDIUM)
-//           end
-          
-//            L0S_IDLE: begin
-//           `uvm_do_with(req, { ts_type == OS_EIE; })
-//              `uvm_info("SIV_PCIE_SEQ", "EP: Sent EIEOS (00h,11h) OS IN L0S_IDLE", UVM_MEDIUM)
-//           end
-         
-//           L0S_FTS: begin
-//          if(!eie_sent) begin
-//            `uvm_do_with(req, { (ts_type == OS_EIE);})
-//            `uvm_info("SIV_PCIE_SEQ", $sformatf("EP: Sent EIE OS in L0S_FTS EIE_sent=%0d",eie_sent), UVM_MEDIUM)
-//             end
-            
-//             if (fts_sent) begin     
-//        `uvm_do_with(req, { ts_type == (cur_data_rate inside {`SPEED_2_5_GTS, `SPEED_5_GTS} ? OS_SKP : OS_SDS); })
-//             `uvm_info("SIV_PCIE_SEQ", $sformatf("EP: Sent %s OS", cur_data_rate inside {`SPEED_2_5_GTS, `SPEED_5_GTS} ? "SKP" : "SDS"), UVM_MEDIUM)
-//               pl_cfg.l0s_entry_enable=0;    pl_cfg.aspm_l0s_support=0;
-//         end
-//             if (eie_sent && !fts_sent)
-//               begin
-//                 `uvm_do_with(req, { ts_type == OS_FTS;})
-//                 `uvm_info("SIV_PCIE_SEQ", $sformatf("EP: Sent FTS OS in L0S_FTS fts_sent=%0d ",fts_sent), UVM_MEDIUM)
-//               end
-//           end
-         
-//          L1_ENTRY: begin
-//             `uvm_do_with(req, { ts_type == OS_EIOS; })
-//            `uvm_info("SIV_PCIE_SEQ", $sformatf("EP: Sent EIOS OS IN L1_ENTRY"), UVM_MEDIUM)
-//           end
-          
-//          L1_IDLE: begin
-//           `uvm_do_with(req, { ts_type == OS_EIE; })
-//            `uvm_info("SIV_PCIE_SEQ","EP: Sent EIEOS (00h,11h) OS IN L1_IDLE", UVM_MEDIUM)
-//            pl_cfg.l1_entry_enable=0;    pl_cfg.aspm_l1_support=0;
-//           end 
-          
            L2_IDLE: begin
          pl_cfg.l2_entry_enable=0;
-           //`uvm_info("SIV_PCIE_SEQ",$sformatf("EP:  in L2_IDLE"), UVM_MEDIUM)
+         
+           `uvm_info("SIV_PCIE_SEQ",$sformatf("EP:  in L2_IDLE"), UVM_MEDIUM)
           end
            L2_TRANSMITWAKE: begin
+           
           `uvm_do_with(req, { ts_type == OS_EIE; })
              `uvm_info("SIV_PCIE_SEQ","EP: Sent EIEOS (00h,ffh) OS IN L2_TRANSMITWAKE", UVM_MEDIUM)
            
@@ -558,6 +475,8 @@ class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
     end
   endtask
 endclass
+
+
 /////////////////////////////////////////TIMEOUT OF ///////////////////////////////////////////////
 class siv_detect_from_polling_active_seq extends uvm_sequence #(siv_ltssm_seq_item);
   `uvm_object_utils(siv_detect_from_polling_active_seq)

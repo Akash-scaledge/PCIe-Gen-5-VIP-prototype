@@ -11,6 +11,7 @@ interface siv_ltssm_intf(input logic clk, input logic rst);
   logic [4:0] current_state; // Current LTSSM state
   logic  tx_elec_idle;      // Transmitter electrical Idle
   logic  rx_elec_idle;     // Receiver electrical Idle
+  logic  beacon_signal;
 endinterface
 
 //--------------------------------------------------------------

@@ -19,8 +19,8 @@ class siv_pcie_base_test extends uvm_test;
   dlcmsm_seq     rc_dl_seq;
   dlcmsm_seq     ep_dl_seq;
 
-  siv_ltssm_seq  rc_pl_seq;
-  siv_ltssm_seq  ep_pl_seq;
+  siv_ltssm_seq_L2  rc_pl_seq;
+  siv_ltssm_seq_L2  ep_pl_seq;
 
   // ------------------------------------------------------------
   // Constructor
@@ -44,8 +44,8 @@ class siv_pcie_base_test extends uvm_test;
     rc_dl_seq = dlcmsm_seq    ::type_id::create("rc_dl_seq");
     ep_dl_seq = dlcmsm_seq    ::type_id::create("ep_dl_seq");
 
-    rc_pl_seq = siv_ltssm_seq ::type_id::create("rc_pl_seq");
-    ep_pl_seq = siv_ltssm_seq ::type_id::create("ep_pl_seq");
+    rc_pl_seq = siv_ltssm_seq_L2 ::type_id::create("rc_pl_seq");
+    ep_pl_seq = siv_ltssm_seq_L2 ::type_id::create("ep_pl_seq");
   endfunction
 
   // ----------------------------------------
@@ -80,8 +80,8 @@ class siv_pcie_base_test extends uvm_test;
     ep_dl_seq = dlcmsm_seq::type_id::create("ep_dl_seq", this);
 
     fork
-      rc_dl_seq.start(env.rc_agent.dl_agent.sequencer);
-      ep_dl_seq.start(env.ep_agent.dl_agent.sequencer);
+     // rc_dl_seq.start(env.rc_agent.dl_agent.sequencer);
+      //ep_dl_seq.start(env.ep_agent.dl_agent.sequencer);
     join
 
   endtask
@@ -93,8 +93,8 @@ class siv_pcie_base_test extends uvm_test;
   task run_PL(uvm_phase phase);
     phase.raise_objection(this);
     // Create sequences
-    rc_pl_seq = siv_ltssm_seq::type_id::create("rc_pl_seq");
-    ep_pl_seq = siv_ltssm_seq::type_id::create("ep_pl_seq");
+    rc_pl_seq = siv_ltssm_seq_L2::type_id::create("rc_pl_seq");
+    ep_pl_seq = siv_ltssm_seq_L2::type_id::create("ep_pl_seq");
     `uvm_info("TEST_START_pl", "Starting RC and EP sequences", UVM_MEDIUM)
     // Run sequences in parallel
     fork
