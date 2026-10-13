@@ -311,9 +311,18 @@ class pcie_dl_seq_item extends uvm_sequence_item;
           replay_item.tlps_pkt.AT      = hdr[11:10];
           replay_item.tlps_pkt.length  = hdr[9:0];
           replay_item.tlps_pkt.sdw     = buffer[data_index + 2];
-          replay_item.tlps_pkt.Address = buffer[data_index + 3];
-          replay_item.payload = new[payload_length];
-          foreach (replay_item.payload[k]) replay_item.payload[k] = buffer[data_index + 4 + k];
+          // Stored layout: hdr1, hdr2, hdr3, then hdr4 (4 DW header only) and the
+          // payload, counted together in payload_length.
+          if (replay_item.tlps_pkt.Fmt[0] && payload_length > 0) begin
+            replay_item.tlps_pkt.Address = {buffer[data_index + 3], buffer[data_index + 4]};
+            replay_item.payload = new[payload_length - 1];
+            foreach (replay_item.payload[k]) replay_item.payload[k] = buffer[data_index + 5 + k];
+          end
+          else begin
+            replay_item.tlps_pkt.Address = buffer[data_index + 3];
+            replay_item.payload = new[payload_length];
+            foreach (replay_item.payload[k]) replay_item.payload[k] = buffer[data_index + 4 + k];
+          end
           replay_item.do_pack_bytes();
           // Add to output queue
           items.push_back(replay_item);
@@ -338,6 +347,14 @@ class pcie_dl_seq_item extends uvm_sequence_item;
       device_replay_buffer[dev_id] = {};
     end
     buffer = device_replay_buffer[dev_id];
+  endfunction
+
+  // DL_Down: discard every TLP of this device in the replay buffer
+  static function void clear_replay_buffer_static(int dev_id);
+    device_replay_buffer[dev_id]      = {};
+    device_replay_count[dev_id]       = 0;
+    device_oldest_unacked_seq[dev_id] = 0;
+    device_next_tx_seq[dev_id]        = 0;
   endfunction
 
   static function int get_replay_count_static(int dev_id);
@@ -480,10 +497,14 @@ class pcie_dl_seq_item extends uvm_sequence_item;
     	tlp_header1 = {tlps_pkt.Fmt,tlps_pkt.Type,tlps_pkt.rsvd1,tlps_pkt.TC,tlps_pkt.rsvd2,tlps_pkt.attr1,tlps_pkt.rsvd3,tlps_pkt.TH,tlps_pkt.TD,tlps_pkt.EP,tlps_pkt.attr2,tlps_pkt.AT,tlps_pkt.length};
 //     tlp_header1 = {tlps_pkt.length, tlps_pkt.Address[63:42]};
     tlp_header2 = {tlps_pkt.sdw};
-    tlp_header3 = {tlps_pkt.Address};
+    // 3 DW header: DW2 = Address[31:0]
+    // 4 DW header (Fmt[0] = 1, 64-bit address): DW2 = Address[63:32], DW3 = Address[31:0]
+    tlp_header3 = tlps_pkt.Fmt[0] ? tlps_pkt.Address[63:32] : tlps_pkt.Address[31:0];
     tx_buffer.push_back(tlp_header1);
     tx_buffer.push_back(tlp_header2);
     tx_buffer.push_back(tlp_header3);
+    if (tlps_pkt.Fmt[0])
+      tx_buffer.push_back(tlps_pkt.Address[31:0]);
     foreach (payload[i]) 
       tx_buffer.push_back(payload[i]);    
   endfunction
@@ -602,14 +623,37 @@ class pcie_dl_seq_item extends uvm_sequence_item;
         dllps_pkt.crc16     = dllp_pkt[1][31:16];
       end
     end 
-    else begin // TLP
-      seq_num[11:0]=tlp_pkt[0][31:20];
-      tlps_pkt.length = tlp_pkt[0][19:10];
-      tlps_pkt.Address = {tlp_pkt[0][9:0], tlp_pkt[1], tlp_pkt[2][31:10]};
-      num_payload_dwords = tlps_pkt.length;
+    else begin // TLP: tlp_pkt = {seq DW, header (3 or 4 DW), payload..., LCRC}
+      int hdr_dws;
+      bit [31:0] h0;
+      seq_num[11:0] = tlp_pkt[0][31:20];
+      num_payload_dwords = 0;
+      if (tlp_pkt.size() >= 5) begin
+        h0 = tlp_pkt[1];
+        tlps_pkt.Fmt    = h0[31:29];
+        tlps_pkt.Type   = h0[28:24];
+        tlps_pkt.rsvd1  = h0[23];
+        tlps_pkt.TC     = h0[22:20];
+        tlps_pkt.rsvd2  = h0[19];
+        tlps_pkt.attr1  = h0[18];
+        tlps_pkt.rsvd3  = h0[17];
+        tlps_pkt.TH     = h0[16];
+        tlps_pkt.TD     = h0[15];
+        tlps_pkt.EP     = h0[14];
+        tlps_pkt.attr2  = h0[13:12];
+        tlps_pkt.AT     = h0[11:10];
+        tlps_pkt.length = h0[9:0];
+        tlps_pkt.sdw    = tlp_pkt[2];
+        hdr_dws = h0[29] ? 4 : 3;
+        if (hdr_dws == 4 && tlp_pkt.size() >= 6) tlps_pkt.Address = {tlp_pkt[3], tlp_pkt[4]};
+        else                                     tlps_pkt.Address = tlp_pkt[3];
+        // payload = everything between the header and the LCRC
+        num_payload_dwords = tlp_pkt.size() - 2 - hdr_dws;
+        if (num_payload_dwords < 0) num_payload_dwords = 0;
+      end
       payload = new[num_payload_dwords];
       for (int i = 0; i < num_payload_dwords; i++)
-        payload[i] = tlp_pkt[3 + i];
+        payload[i] = tlp_pkt[1 + hdr_dws + i];
     end
     received_lcrc = tlp_pkt[tlp_pkt.size()-1];
   endfunction

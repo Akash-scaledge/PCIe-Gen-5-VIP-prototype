@@ -15,6 +15,11 @@ class pcie_dl_cfg extends uvm_object;
   bit [1:0] local_data_scale = 2'b01; // Example: 16x scaling 
   bit [1:0] remote_hdr_scale;         // Captured from partner
   bit [1:0] remote_data_scale;        // Captured from partner
+
+  // Receiver flow control
+  bit rx_fc_auto_update   = 0;   // 1: credits of every TLP passed to the TL are returned with UpdateFC
+  int rx_fc_update_cycles = 100; // clocks between freeing credits and sending the UpdateFC
+  int rx_fc_refresh_cycles = 1000; // UpdateFC of every credit type is repeated after this many idle clocks
   
   bit is_rc;
   bit is_active;
