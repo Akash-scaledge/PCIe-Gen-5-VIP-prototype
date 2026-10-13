@@ -47,7 +47,7 @@ class pcie_dl_seq_item extends uvm_sequence_item;
   bit [31:0] dllp_pkt[$]; // 32-bit queue (DWORDs)
   bit [31:0] tlp_pkt[$];  // 32-bit queue (DWORDs)
 
-  rand bit [11:0] seq_num;bit sclh;bit scld;
+  rand bit [11:0] seq_num;bit [2:0] sclh;bit [2:0] scld;   // scale shift 0/2/4 (was 1 bit: 4 and 2 were truncated to 0)
 
 
   //replay buffers and tracking

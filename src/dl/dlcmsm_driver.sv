@@ -29,6 +29,16 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   int pd_cost;
   bit ph_ok, pd_ok;
 
+  // --- Flow-control initialisation / credit gating ---
+  // Index 0 = Posted, 1 = Non-Posted, 2 = Completion
+  bit  fc_init_rcvd[3];            // FC_INIT1: credits recorded for this type (from InitFC1 or InitFC2)
+  bit  tx_fc_hdr_inf[3];           // partner advertised infinite header credits (HdrFC = 0 in InitFC)
+  bit  tx_fc_data_inf[3];          // partner advertised infinite data credits (DataFC = 0 in InitFC)
+  int  initfc_resend_cycles = 200; // InitFC1/InitFC2 repeat interval in clocks (spec: at least every 34 us; LTSSM_1MS = 250 clocks here)
+  int  initfc_idle_cycles   = 0;   // cycles since the last InitFC DLLP was sent
+  pcie_dl_seq_item initfc_sent[bit [7:0]]; // last InitFC DLLP sent, per DLLP type (used for resends)
+  bit  dlf_ack_sent = 0;           // a Data Link Feature DLLP with Feature Ack = 1 has been sent
+
   process pr[2];
 
   bit send_tlp;int cntr_tlp;
@@ -279,6 +289,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   //   partner DLF DLLPs as per PCIe Data Link Feature Exchange protocol.
   //--------------------------------------------------------------------------
   task dlcmsm_tx_dlf();
+    dlf_ack_sent = 0;
     while(fsm.curr_state == DL_FEATURE) begin
       pcie_dl_seq_item req;
 
@@ -314,6 +325,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                   $sformatf("SENDING DL FEATURE DLLP=%p",req.dllp_pkt),
                   UVM_NONE)
         drive(req);
+        if (req.dllps_f_pkt.feature_ack) dlf_ack_sent = 1;
       end
 
       // Complete sequence item handshake
@@ -379,11 +391,12 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
           // CRC validation
           if(comp_crc==rx_dword[31:16]) begin
             cfg.dl_feature_sprt_valid   = 1'b1;
-            cfg.remote_feature_support = rx_item.dllp_pkt[1][22:0];
+            // rx_item.dllp_pkt holds no SDP marker: [0] = DLF DW, [1] = CRC DW
+            cfg.remote_feature_support = rx_item.dllp_pkt[0][22:0];
             cfg.scaled_flow_control_spprt = scl_en;
 
-            // Update remote feature status register
-            reg_model.remote_f_reg.set({1'b1,30'b0,scl_en});
+            // Update remote feature status register: [31] valid, [22:0] remote feature support
+            reg_model.remote_f_reg.set({1'b1, 8'b0, rx_item.dllp_pkt[0][22:0]});
             remote_data = reg_model.remote_f_reg.get();
 
             `uvm_info(get_type_name(),
@@ -402,9 +415,14 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                                  rx_item.dllp_pkt,comp_crc))
           end
 
-          // Trigger FSM transition based on ACK bit
-          fsm.go_init = f_ack;
-          fsm.update_state();
+          // Leave DL_FEATURE when the partner acknowledged our feature DLLP and
+          // we have already sent an acknowledging DLLP ourselves (otherwise the
+          // partner, now with its own DLCMSM, could wait forever for our Ack).
+          // A DLLP with a bad CRC is discarded and never moves the FSM.
+          if (comp_crc == rx_dword[31:16] && f_ack && dlf_ack_sent) begin
+            fsm.go_init = 1;
+            fsm.update_state();
+          end
         end
 
         //------------------------------------------------------------------
@@ -552,6 +570,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   //Update state each clock cycle
   task update_fsm();
     fork
+      initfc_retransmit();
       begin forever begin
         @(posedge vif.clk);
         fsm.update_state();
@@ -563,6 +582,62 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
         `uvm_info(get_type_name(), $sformatf("Device %0d: DLCMSM state change from %s to %s", cfg.device_id, cfg.last_state, cfg.curr_state), UVM_LOW);
       end end
     join
+  endtask
+
+
+  //--------------------------------------------------------------------------
+  // Task: initfc_retransmit
+  //   Spec (FC_INIT1/FC_INIT2): InitFC1 (resp. InitFC2) DLLPs for P, NP and
+  //   Cpl are sent in that order and repeated at least every 34 us until the
+  //   state is left. The DL sequence sends each set once, so a single lost or
+  //   corrupted DLLP used to hang initialisation. If no InitFC DLLP was sent
+  //   for initfc_resend_cycles, the set for the current state is sent again,
+  //   with the credit values the sequence used.
+  //   Also clears the FC_INIT1 bookkeeping whenever the DLCMSM is not in
+  //   flow-control initialisation or DL_ACTIVE (e.g. after a DL_Down).
+  //--------------------------------------------------------------------------
+  task initfc_retransmit();
+    forever begin
+      @(posedge vif.clk);
+      if (!(fsm.curr_state inside {FC_INIT1, FC_INIT2, DL_ACTIVE})) begin
+        fc_init_rcvd = '{0, 0, 0};
+      end
+      if (!(fsm.curr_state inside {FC_INIT1, FC_INIT2})) begin
+        initfc_idle_cycles = 0;
+        continue;
+      end
+      initfc_idle_cycles++;
+      if (initfc_idle_cycles < initfc_resend_cycles) continue;
+      initfc_idle_cycles = 0;
+      resend_initfc(fsm.curr_state == FC_INIT1);
+    end
+  endtask
+
+  task resend_initfc(bit fc1);
+    bit [7:0] t1[3];
+    bit [7:0] t2[3];
+    pcie_dl_seq_item src, req;
+    t1 = '{INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0};
+    t2 = '{INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0};
+    for (int c = 0; c < 3; c++) begin
+      // InitFC1 and InitFC2 of one credit type carry the same credit values
+      src = null;
+      if (initfc_sent.exists(fc1 ? t1[c] : t2[c]))      src = initfc_sent[fc1 ? t1[c] : t2[c]];
+      else if (initfc_sent.exists(fc1 ? t2[c] : t1[c])) src = initfc_sent[fc1 ? t2[c] : t1[c]];
+      if (src == null) continue;   // the sequence never advertised this type: nothing to repeat
+      req = pcie_dl_seq_item::type_id::create("initfc_resend");
+      req.device_id = cfg.device_id;
+      req.is_tlp = 0;
+      req.is_nop = 0;
+      req.is_pm  = 0;
+      req.acknak_pkt.dllp_type = ACK_DLLP_TYPE;   // 0: not an Ack/Nak
+      req.dllps_pkt = src.dllps_pkt;
+      req.dllps_pkt.dllp_type = dllp_type_e'(fc1 ? t1[c] : t2[c]);
+      `uvm_info(get_type_name(), $sformatf("Device %0d: %s - repeating %s (HdrFC=%0d DataFC=%0d)",
+                                           cfg.device_id, fsm.curr_state.name(), req.dllps_pkt.dllp_type.name(),
+                                           req.dllps_pkt.HdrFC, req.dllps_pkt.DataFC), UVM_LOW)
+      send_dllp(req);
+    end
   endtask
 
   task collect_tlps(uvm_phase phase);
@@ -740,6 +815,12 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   //--------------------------------------------------------------------------
   task send_dllp(pcie_dl_seq_item req);
     req.device_id = cfg.device_id;
+    if (!req.is_tlp && !req.is_nop && !req.is_pm &&
+        req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
+                                        INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
+      initfc_sent[req.dllps_pkt.dllp_type] = req;
+      initfc_idle_cycles = 0;
+    end
     req.do_pack_bytes();
     req.dllp_pkt.push_front(32'hDEADBEEA);
 
@@ -938,11 +1019,12 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   endfunction
 
   // Spec gating rule: (CREDIT_LIMIT - (CREDITS_CONSUMED + cost)) mod 2^N <= 2^(N-1)
-  // A limit of 0 advertised in InitFC means "infinite credits".
-  function bit fc_credit_ok(int limit, int consumed, int cost, int width);
+  // Infinite credits (0 advertised in InitFC for that field) are never gated.
+  // A CREDIT_LIMIT of 0 reached through UpdateFC is a real limit.
+  function bit fc_credit_ok(bit infinite, int limit, int consumed, int cost, int width);
     int modv;
     int r;
-    if (cost == 0 || limit == 0) return 1;
+    if (cost == 0 || infinite) return 1;
     modv = 1 << width;
     r = (limit - (consumed + cost)) % modv;
     if (r < 0) r += modv;
@@ -954,9 +1036,9 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     hw = fc_hdr_width();
     dw = fc_data_width();
     case (fc_type)
-      0:       return fc_credit_ok(tx_ph_limit,   tx_ph_consumed,   hdr_cost, hw) && fc_credit_ok(tx_pd_limit,   tx_pd_consumed,   data_cost, dw);
-      1:       return fc_credit_ok(tx_nph_limit,  tx_nph_consumed,  hdr_cost, hw) && fc_credit_ok(tx_npd_limit,  tx_npd_consumed,  data_cost, dw);
-      default: return fc_credit_ok(tx_cplh_limit, tx_cplh_consumed, hdr_cost, hw) && fc_credit_ok(tx_cpld_limit, tx_cpld_consumed, data_cost, dw);
+      0:       return fc_credit_ok(tx_fc_hdr_inf[0], tx_ph_limit,   tx_ph_consumed,   hdr_cost, hw) && fc_credit_ok(tx_fc_data_inf[0], tx_pd_limit,   tx_pd_consumed,   data_cost, dw);
+      1:       return fc_credit_ok(tx_fc_hdr_inf[1], tx_nph_limit,  tx_nph_consumed,  hdr_cost, hw) && fc_credit_ok(tx_fc_data_inf[1], tx_npd_limit,  tx_npd_consumed,  data_cost, dw);
+      default: return fc_credit_ok(tx_fc_hdr_inf[2], tx_cplh_limit, tx_cplh_consumed, hdr_cost, hw) && fc_credit_ok(tx_fc_data_inf[2], tx_cpld_limit, tx_cpld_consumed, data_cost, dw);
     endcase
   endfunction
 
@@ -982,6 +1064,121 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                                     cfg.device_id, fc_type_name(fc_type), hdr_cost, data_cost,
                                     tx_ph_consumed, tx_pd_consumed, tx_nph_consumed, tx_npd_consumed,
                                     tx_cplh_consumed, tx_cpld_consumed), UVM_MEDIUM);
+  endfunction
+
+  // Receive rule: duplicate if (NEXT_RCV_SEQ - seq) mod 4096 <= 2048 (seq != NEXT_RCV_SEQ)
+  function bit seq_is_duplicate(bit [11:0] seq);
+    bit [11:0] d;
+    d = next_rcv_seq - seq;
+    return (d != 0 && d <= 12'd2048);
+  endfunction
+
+  //--------------------------------------------------------------------------
+  // Receive side of flow-control initialisation and credit updates
+  //--------------------------------------------------------------------------
+  // Credit type from the DLLP type: bits [5:4] = 00 P, 01 NP, 10 Cpl
+  function int fc_class(bit [7:0] t);
+    case (t[5:4])
+      2'b00:   return 0;
+      2'b01:   return 1;
+      default: return 2;
+    endcase
+  endfunction
+
+  function bit scaled_fc_active();
+    return (local_data[0] && remote_data[0]);
+  endfunction
+
+  // Scaled FC: HdrScale/DataScale 01 = x1, 10 = x4, 11 = x16 (00 = not used)
+  function int fc_scale_shift(bit [1:0] sc);
+    case (sc)
+      2'b10:   return 2;
+      2'b11:   return 4;
+      default: return 0;
+    endcase
+  endfunction
+
+  // Record the credit limit the partner advertised for credit type c.
+  //   is_init = 1 : InitFC1/InitFC2 (a value of 0 means infinite credits)
+  //   is_init = 0 : UpdateFC        (ignored for a field advertised as infinite)
+  function void set_tx_fc_limit(int c, bit [7:0] hdr, bit [11:0] data, bit [1:0] hs, bit [1:0] ds, bit is_init);
+    int h, d;
+    if (is_init) begin
+      tx_fc_hdr_inf[c]  = (hdr  == 0);
+      tx_fc_data_inf[c] = (data == 0);
+    end
+    h = hdr;
+    d = data;
+    if (scaled_fc_active()) begin
+      h = h << fc_scale_shift(hs);
+      d = d << fc_scale_shift(ds);
+    end
+    case (c)
+      0: begin
+        if (!tx_fc_hdr_inf[0])  tx_ph_limit   = h;
+        if (!tx_fc_data_inf[0]) tx_pd_limit   = d;
+      end
+      1: begin
+        if (!tx_fc_hdr_inf[1])  tx_nph_limit  = h;
+        if (!tx_fc_data_inf[1]) tx_npd_limit  = d;
+      end
+      default: begin
+        if (!tx_fc_hdr_inf[2])  tx_cplh_limit = h;
+        if (!tx_fc_data_inf[2]) tx_cpld_limit = d;
+      end
+    endcase
+    `uvm_info(get_type_name(), $sformatf("Device %0d %s %s credit limit: Hdr=%s Data=%s",
+                                         cfg.device_id, is_init ? "InitFC" : "UpdateFC", fc_type_name(c),
+                                         tx_fc_hdr_inf[c]  ? "infinite" : $sformatf("%0d", h),
+                                         tx_fc_data_inf[c] ? "infinite" : $sformatf("%0d", d)), UVM_LOW)
+  endfunction
+
+  // InitFC1 / InitFC2 received
+  //   FC_INIT1: record the credits from InitFC1 OR InitFC2 of each type, in
+  //             any order; FI1 (-> FC_INIT2) once P, NP and Cpl are recorded.
+  //   FC_INIT2: credit values are ignored; any InitFC2 sets FI2 (-> DL_ACTIVE).
+  //   Other states: ignored.
+  function void rx_initfc(pcie_dl_seq_item rx_item);
+    int c;
+    c = fc_class(rx_item.dllps_pkt.dllp_type);
+    case (fsm.curr_state)
+      FC_INIT1: begin
+        if (!fc_init_rcvd[c]) begin
+          set_tx_fc_limit(c, rx_item.dllps_pkt.HdrFC, rx_item.dllps_pkt.DataFC,
+                          rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.rsvd2, 1);
+          fc_init_rcvd[c] = 1;
+        end
+        if (fc_init_rcvd[0] && fc_init_rcvd[1] && fc_init_rcvd[2] && !fsm.go_fc2_state) begin
+          fsm.go_fc2_state = 1;
+          `uvm_info(get_type_name(), $sformatf("Device %0d: credits for P, NP and Cpl recorded (FI1), moving to FC_INIT2", cfg.device_id), UVM_LOW);
+        end
+      end
+      FC_INIT2: begin
+        if (rx_item.dllps_pkt.dllp_type inside {INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0} && !fsm.go_active) begin
+          fsm.go_active = 1;
+          `uvm_info(get_type_name(), $sformatf("Device %0d: InitFC2 received (FI2), moving to DL_ACTIVE", cfg.device_id), UVM_LOW);
+        end
+      end
+      default: begin
+        `uvm_info(get_type_name(), $sformatf("Device %0d: %s ignored in %s", cfg.device_id,
+                                             rx_item.dllps_pkt.dllp_type.name(), fsm.curr_state.name()), UVM_MEDIUM);
+      end
+    endcase
+  endfunction
+
+  // UpdateFC received: sets FI2 in FC_INIT2; updates the limit in FC_INIT2/DL_ACTIVE
+  function void rx_updatefc(pcie_dl_seq_item rx_item);
+    if (fsm.curr_state == FC_INIT2 && !fsm.go_active) begin
+      fsm.go_active = 1;
+      `uvm_info(get_type_name(), $sformatf("Device %0d: UpdateFC received (FI2), moving to DL_ACTIVE", cfg.device_id), UVM_LOW);
+    end
+    if (!(fsm.curr_state inside {FC_INIT2, DL_ACTIVE})) begin
+      `uvm_info(get_type_name(), $sformatf("Device %0d: %s ignored in %s", cfg.device_id,
+                                           rx_item.dllps_pkt.dllp_type.name(), fsm.curr_state.name()), UVM_MEDIUM);
+      return;
+    end
+    set_tx_fc_limit(fc_class(rx_item.dllps_pkt.dllp_type), rx_item.dllps_pkt.HdrFC, rx_item.dllps_pkt.DataFC,
+                    rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.rsvd2, 0);
   endfunction
 
   // Drive the transaction DWORD-wise on interface
@@ -1099,17 +1296,24 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
               `uvm_info(get_type_name(), $sformatf("Device %0d: Good TLP seq_num %0d received - timer continues running (will ACK up to %0d)", cfg.device_id, received_seq, received_seq), UVM_LOW);
 
             end 
-            else if (received_seq > next_rcv_seq) begin
-              `uvm_warning("SEQ_CHECK", $sformatf("Device %0d: Out-of-sequence: received=%0d expected=%0d - Scheduling Nak", cfg.device_id, received_seq, next_rcv_seq));
-              nak_scheduled = 1;
-              ack_timer_running = 0;
-              acknak_latency_timer.stop_timer();
-              schedule_nak(next_rcv_seq - 1);
-            end 
+            // Spec: if (NEXT_RCV_SEQ - Sequence Number) mod 4096 <= 2048 the TLP is a
+            // duplicate (discard, Ack NEXT_RCV_SEQ - 1); otherwise it is out of
+            // sequence (discard, Nak NEXT_RCV_SEQ - 1 unless a Nak is already scheduled).
+            else if (seq_is_duplicate(received_seq)) begin
+              `uvm_info("SEQ_CHECK", $sformatf("Device %0d: Duplicate TLP detected: received=%0d expected=%0d - Sending immediate ACK for seq %0d", cfg.device_id, received_seq, next_rcv_seq, next_rcv_seq - 12'd1), UVM_LOW);
+              schedule_ack(next_rcv_seq - 12'd1);
+            end
             else begin
-              `uvm_info("SEQ_CHECK", $sformatf("Device %0d: Duplicate TLP detected: received=%0d expected=%0d - Sending immediate ACK for last good seq %0d", cfg.device_id, received_seq, next_rcv_seq, last_good_seq_num_to_ack), UVM_LOW);
-              //schedule_ack(last_good_seq_num_to_ack);
-              schedule_ack(last_good_seq_num_to_ack);
+              `uvm_warning("SEQ_CHECK", $sformatf("Device %0d: Out-of-sequence: received=%0d expected=%0d - Scheduling Nak", cfg.device_id, received_seq, next_rcv_seq));
+              if (!nak_scheduled) begin
+                nak_scheduled = 1;
+                ack_timer_running = 0;
+                acknak_latency_timer.stop_timer();
+                schedule_nak(next_rcv_seq - 12'd1);
+              end
+              else begin
+                `uvm_info("SEQ_CHECK", $sformatf("Device %0d: NAK already scheduled - no new NAK", cfg.device_id), UVM_LOW);
+              end
             end
           end
           rx_tlp_item.received_lcrc = received_lcrc;
@@ -1305,259 +1509,23 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
             end
 
             // DLLP types
-            INITFC1_P_VC0: begin
-              dllp_P_rcvd = 1;
-              `uvm_info(get_type_name(), 
+            INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
+            INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0: begin
+              `uvm_info(get_type_name(),
                         $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
                                   cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
                                   rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
                                   rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              tx_ph_limit = rx_item.dllps_pkt.HdrFC;   // Capture Header Limit
-              tx_pd_limit = rx_item.dllps_pkt.DataFC;  // Capture Data Limit
-
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_ph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_pd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-
-              end
-
-              // Keep your existing state logic for INITFC1/2 completion
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_P_VC0) dllp_P_rcvd = 1;
-
-              // Keep your existing uvm_info
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated POSTED Credits: PH_Limit=%0d PD_Limit=%0d", 
-                                                   cfg.device_id, tx_ph_limit, tx_pd_limit), UVM_NONE);
-            end
-
-            INITFC1_NP_VC0: begin
-              if (dllp_P_rcvd) dllp_NP_rcvd = 1;
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              tx_nph_limit = rx_item.dllps_pkt.HdrFC;
-              tx_npd_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_nph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_npd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_NP_VC0 && dllp_P_rcvd) dllp_NP_rcvd = 1;
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated NON-POSTED Credits: NPH_Limit=%0d NPD_Limit=%0d", 
-                                                   cfg.device_id, tx_nph_limit, tx_npd_limit), UVM_NONE);
-            end
-
-            INITFC1_CPL_VC0: begin
-              if (dllp_P_rcvd && dllp_NP_rcvd) begin
-                dllp_CPL_rcvd = 1;
-                fsm.go_fc2_state = 1;
-                `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed, moving to FC_INIT2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_NONE);
-              tx_cplh_limit = rx_item.dllps_pkt.HdrFC;
-              tx_cpld_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_cplh_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_cpld_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              // Existing FSM transition logic
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_CPL_VC0 && dllp_P_rcvd && dllp_NP_rcvd) begin
-                dllp_CPL_rcvd = 1;
-                fsm.go_fc2_state = 1;
-                `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed", cfg.device_id), UVM_LOW);
-              end
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated CPL Credits: CPLH_Limit=%0d CPLD_Limit=%0d", 
-                                                   cfg.device_id, tx_cplh_limit, tx_cpld_limit), UVM_NONE);
-            end
-
-            INITFC2_P_VC0: begin
-              if (fsm.curr_state == FC_INIT2 && fsm.go_fc2_state && !fsm.go_active) begin
-                fsm.go_active = 1;
-                repeat(2) @(posedge vif.clk);
-                `uvm_info(get_type_name(), $sformatf("Device %0d: FSM: Transitioning to DL_ACTIVE after INITFC2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              tx_ph_limit = rx_item.dllps_pkt.HdrFC;   // Capture Header Limit
-              tx_pd_limit = rx_item.dllps_pkt.DataFC;  // Capture Data Limit
-
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_ph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_pd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              // Keep your existing state logic for INITFC1/2 completion
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_P_VC0) dllp_P_rcvd = 1;
-
-              // Keep your existing uvm_info
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated POSTED Credits: PH_Limit=%0d PD_Limit=%0d", 
-                                                   cfg.device_id, tx_ph_limit, tx_pd_limit), UVM_NONE);
-            end
-
-            INITFC2_NP_VC0: begin
-              if (fsm.curr_state == FC_INIT2 && fsm.go_fc2_state && !fsm.go_active) begin
-                fsm.go_active = 1;
-                repeat(2) @(posedge vif.clk);
-                `uvm_info(get_type_name(), $sformatf("Device %0d: FSM: Transitioning to DL_ACTIVE after INITFC2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_NONE);
-              tx_nph_limit = rx_item.dllps_pkt.HdrFC;
-              tx_npd_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_nph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_npd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_NP_VC0 && dllp_P_rcvd) dllp_NP_rcvd = 1;
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated NON-POSTED Credits: NPH_Limit=%0d NPD_Limit=%0d", 
-                                                   cfg.device_id, tx_nph_limit, tx_npd_limit), UVM_HIGH);
-            end
-
-            INITFC2_CPL_VC0: begin
-              if (fsm.curr_state == FC_INIT2 && fsm.go_fc2_state && !fsm.go_active) begin
-                fsm.go_active = 1;
-                repeat(2) @(posedge vif.clk);
-                `uvm_info(get_type_name(), $sformatf("Device %0d: FSM: Transitioning to DL_ACTIVE after INITFC2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_NONE);
-              tx_cplh_limit = rx_item.dllps_pkt.HdrFC;
-              tx_cpld_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_cplh_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_cpld_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              // Existing FSM transition logic
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_CPL_VC0 && dllp_P_rcvd && dllp_NP_rcvd) begin
-                dllp_CPL_rcvd = 1;
-                fsm.go_fc2_state = 1;
-                `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed", cfg.device_id), UVM_LOW);
-              end
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated CPL Credits: CPLH_Limit=%0d CPLD_Limit=%0d", 
-                                                   cfg.device_id, tx_cplh_limit, tx_cpld_limit), UVM_NONE);
-            end
-
-            //ACK/NAK DLLP processing with device-specific replay buffer handling
-            ACK_DLLP_TYPE: begin
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX ACK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
-                                  cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
-
-
-            end
-
-            NAK_DLLP_TYPE: begin
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX NAK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
-                                  cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
-
-              //Handle NAK - might need to replay from the NAK'd sequence number
-              handle_nak_replay(rx_item.acknak_pkt.seq_num);
+              rx_initfc(rx_item);
             end
 
             UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0: begin
-              if(fsm.curr_state == FC_INIT2)
-                fsm.go_active = 1;
-              `uvm_info(get_type_name(), 
+              `uvm_info(get_type_name(),
                         $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
                                   cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
                                   rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
                                   rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              if(rx_item.dllps_pkt.dllp_type==UPDATEFC_P_VC0)begin
-                tx_ph_limit = rx_item.dllps_pkt.HdrFC;   // Capture Header Limit
-                tx_pd_limit = rx_item.dllps_pkt.DataFC;  // Capture Data Limit
-
-                if(local_data[0]&&remote_data[0])begin
-                  rx_item.scale_h();
-                  rx_item.scale_d();
-                  tx_ph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                  tx_pd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-                end
-
-                // Keep your existing state logic for INITFC1/2 completion
-                if (rx_item.dllps_pkt.dllp_type == INITFC1_P_VC0) dllp_P_rcvd = 1;
-
-                // Keep your existing uvm_info
-                `uvm_info(get_type_name(), $sformatf("Device %0d Updated POSTED Credits: PH_Limit=%0d PD_Limit=%0d", 
-                                                     cfg.device_id, tx_ph_limit, tx_pd_limit), UVM_HIGH);
-              end
-              if(rx_item.dllps_pkt.dllp_type==UPDATEFC_NP_VC0)begin
-                tx_nph_limit = rx_item.dllps_pkt.HdrFC;
-                tx_npd_limit = rx_item.dllps_pkt.DataFC;
-
-                if(local_data[0]&&remote_data[0])begin
-                  rx_item.scale_h();
-                  rx_item.scale_d();
-                  tx_nph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                  tx_npd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-                end
-
-                if (rx_item.dllps_pkt.dllp_type == INITFC1_NP_VC0 && dllp_P_rcvd) dllp_NP_rcvd = 1;
-
-                `uvm_info(get_type_name(), $sformatf("Device %0d Updated NON-POSTED Credits: NPH_Limit=%0d NPD_Limit=%0d", 
-                                                     cfg.device_id, tx_nph_limit, tx_npd_limit), UVM_HIGH);
-              end
-              if(rx_item.dllps_pkt.dllp_type==UPDATEFC_CPL_VC0)begin
-                tx_cplh_limit = rx_item.dllps_pkt.HdrFC;
-                tx_cpld_limit = rx_item.dllps_pkt.DataFC;
-
-                if(local_data[0]&&remote_data[0])begin
-                  rx_item.scale_h();
-                  rx_item.scale_d();
-                  tx_cplh_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                  tx_cpld_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-                end
-
-                // Existing FSM transition logic
-                if (rx_item.dllps_pkt.dllp_type == INITFC1_CPL_VC0 && dllp_P_rcvd && dllp_NP_rcvd) begin
-                  dllp_CPL_rcvd = 1;
-                  fsm.go_fc2_state = 1;
-                  `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed", cfg.device_id), UVM_LOW);
-                end
-
-                `uvm_info(get_type_name(), $sformatf("Device %0d Updated CPL Credits: CPLH_Limit=%0d CPLD_Limit=%0d", 
-                                                     cfg.device_id, tx_cplh_limit, tx_cpld_limit), UVM_HIGH);
-              end
-
+              rx_updatefc(rx_item);
             end
             //////////////////////////////Power Management AND NOP DLLP Handling////////////////////////////
             NOP:begin 
