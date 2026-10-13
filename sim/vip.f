@@ -10,6 +10,7 @@
 +incdir+src/tl/standalone
 +incdir+src/env
 +incdir+tests
++incdir+tests/dl
 +incdir+tb
 +incdir+tb/standalone
 tb/testbench.sv

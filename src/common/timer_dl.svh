@@ -5,6 +5,7 @@ class timer_uvm_dl extends uvm_object;
   string key;
   bit is_running;
   bit stop_requested = 0;  
+  int unsigned gen = 0;    // countdown generation: stop_timer()/start_timer() invalidate an older countdown
 
   function new(string name = "timer_uvm");
     super.new(name);
@@ -16,10 +17,15 @@ class timer_uvm_dl extends uvm_object;
   endfunction
 
   //NEW METHOD
+  // The timer stops at once and can be started again right away. (Before,
+  // is_running stayed 1 until the old countdown ran out, so a start_timer()
+  // right after stop_timer() was ignored and the timer never expired.)
   function void stop_timer();
     if (is_running) begin
       stop_requested = 1;
-      `uvm_info("TIMER", $sformatf("Timer [%s] stop requested", key), UVM_LOW);
+      is_running = 0;
+      gen++;
+      `uvm_info("TIMER", $sformatf("Timer [%s] stopped", key), UVM_LOW);
     end
   endfunction
 
@@ -32,18 +38,20 @@ class timer_uvm_dl extends uvm_object;
   done_flag = 0;
   stop_requested = 0;
   key = user_key;
+  gen++;
 
   `uvm_info("TIMER", $sformatf("Starting timer [%s] for %0d cycles", key, delay_cycles), UVM_LOW)
   fork
     automatic int local_delay = delay_cycles;
+    automatic int unsigned my_gen = gen;
     begin
       repeat (local_delay) @(posedge vif.clk);
-      // Only set done_flag if not stopped
-      if (!stop_requested) begin
+      // Only expire if this countdown was not stopped or replaced meanwhile
+      if (my_gen == gen) begin
         done_flag = 1;
+        is_running = 0;
         `uvm_info("TIMER", $sformatf("Timer expired after %0d cycles for key = %s", local_delay, key), UVM_LOW)
       end
-      is_running = 0;
     end
   join_none
 endtask

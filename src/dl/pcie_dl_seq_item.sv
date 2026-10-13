@@ -47,7 +47,7 @@ class pcie_dl_seq_item extends uvm_sequence_item;
   bit [31:0] dllp_pkt[$]; // 32-bit queue (DWORDs)
   bit [31:0] tlp_pkt[$];  // 32-bit queue (DWORDs)
 
-  rand bit [11:0] seq_num;bit sclh;bit scld;
+  rand bit [11:0] seq_num;bit [2:0] sclh;bit [2:0] scld;   // scale shift 0/2/4 (was 1 bit: 4 and 2 were truncated to 0)
 
 
   //replay buffers and tracking
@@ -119,11 +119,15 @@ class pcie_dl_seq_item extends uvm_sequence_item;
 
 
   function void store_in_replay_buffer(int dev_id);
+    bit [19:0] pl_dws;  // payload DWORDs of this TLP (everything after the 3 header DWs)
     if (is_tlp && tx_buffer.size() > 0) begin
       init_device_replay_buffer(dev_id);
 
       // Store sequence number first
-      device_replay_buffer[dev_id].push_back({20'b0, seq_num}); // Store seq_num in lower 12 bits
+      // Entry layout: {payload_dw_count[19:0], seq_num[11:0]}, hdr1, hdr2, hdr3, payload..., LCRC
+      // (the DW count is stored explicitly: read requests have Length != 0 but no payload)
+      pl_dws = tx_buffer.size() - 3;
+      device_replay_buffer[dev_id].push_back({pl_dws, seq_num});
 
       // Store the complete TLP data with sequence number header
       device_replay_buffer[dev_id].push_back(header_seq1);
@@ -161,7 +165,7 @@ class pcie_dl_seq_item extends uvm_sequence_item;
         stored_seq_num = device_replay_buffer[dev_id][data_index][11:0];
 
         // Extract payload length from header (bits [19:10] of second stored word - header1)
-        payload_length = (device_replay_buffer[dev_id][data_index + 1] >> 10) & 10'h3FF;
+        payload_length = device_replay_buffer[dev_id][data_index][31:12];  // stored payload DW count
 
         // Print TLP with sequence number
         buffer_str = {buffer_str, $sformatf("  TLP%0d (seq:%0d): ", tlp_index, stored_seq_num)};
@@ -218,15 +222,13 @@ class pcie_dl_seq_item extends uvm_sequence_item;
       int data_index = 0;   
       for (int tlp = 0; tlp < tlps_to_remove && device_replay_buffer[dev_id].size() > 0; tlp++) begin
         if (data_index + 3 < device_replay_buffer[dev_id].size()) begin
+          // Payload DW count is stored in bits [31:12] of the seq_num DWORD
+          payload_length = device_replay_buffer[dev_id][0][31:12];
           // Remove sequence number (1 DWORD)
           if (device_replay_buffer[dev_id].size() > 0) begin
             device_replay_buffer[dev_id].pop_front();
             removed_dwords++;
           end       
-          // Get payload length from header1 (now at front after removing seq_num)
-          if (device_replay_buffer[dev_id].size() > 0) begin
-            payload_length = (device_replay_buffer[dev_id][0] >> 10) & 10'h3FF;
-          end
 
           // Remove header (3 DWORDs)
           for (int hdr = 0; hdr < 3 && device_replay_buffer[dev_id].size() > 0; hdr++) begin
@@ -266,6 +268,7 @@ class pcie_dl_seq_item extends uvm_sequence_item;
     int data_index = 0;
     bit [11:0] current_seq;
     int payload_length;
+    bit [31:0] hdr;
     pcie_dl_seq_item replay_item;
 
     // Get the raw buffer
@@ -282,27 +285,44 @@ class pcie_dl_seq_item extends uvm_sequence_item;
         if (((current_seq >= start_seq) && (start_seq <= current_seq)) ||
             ((start_seq > current_seq) && ((current_seq + 4096 - start_seq) < 2048))) begin  // Forward progress check
 
-          // Extract payload length from header_seq1 (bits [19:10])
-          payload_length = (buffer[data_index + 1] >> 10) & 10'h3FF;
+          // Payload DW count is stored in bits [31:12] of the seq_num DWORD
+          payload_length = buffer[data_index][31:12];
+          if (data_index + 4 + payload_length >= buffer.size()) break;  // incomplete entry
 
-          // Create and populate the replay_item
+          // Rebuild the TLP from the stored DWORDs: same sequence number,
+          // header and payload, so do_pack_bytes() gives the same LCRC.
           replay_item = pcie_dl_seq_item::type_id::create("replay_item");
           replay_item.device_id = dev_id;
           replay_item.is_tlp = 1;
-
-          // Populate tlp_pkt directly (matching RX unpacking: headers, payload, LCRC)
-          replay_item.tlp_pkt.delete();
-          replay_item.tlp_pkt.push_back(buffer[data_index + 1]);  // header_seq1 (contains seq_num)
-          replay_item.tlp_pkt.push_back(buffer[data_index + 2]);  // header_seq2
-          replay_item.tlp_pkt.push_back(buffer[data_index + 3]);  // header_seq3
-          for (int i = 0; i < payload_length; i++) begin
-            replay_item.tlp_pkt.push_back(buffer[data_index + 4 + i]);  // payload DWORDs
+          replay_item.from_TL = 1;
+          replay_item.seq_num = current_seq;
+          hdr = buffer[data_index + 1];
+          replay_item.tlps_pkt.Fmt     = hdr[31:29];
+          replay_item.tlps_pkt.Type    = hdr[28:24];
+          replay_item.tlps_pkt.rsvd1   = hdr[23];
+          replay_item.tlps_pkt.TC      = hdr[22:20];
+          replay_item.tlps_pkt.rsvd2   = hdr[19];
+          replay_item.tlps_pkt.attr1   = hdr[18];
+          replay_item.tlps_pkt.rsvd3   = hdr[17];
+          replay_item.tlps_pkt.TH      = hdr[16];
+          replay_item.tlps_pkt.TD      = hdr[15];
+          replay_item.tlps_pkt.EP      = hdr[14];
+          replay_item.tlps_pkt.attr2   = hdr[13:12];
+          replay_item.tlps_pkt.AT      = hdr[11:10];
+          replay_item.tlps_pkt.length  = hdr[9:0];
+          replay_item.tlps_pkt.sdw     = buffer[data_index + 2];
+          // Stored layout: hdr1, hdr2, hdr3, then hdr4 (4 DW header only) and the
+          // payload, counted together in payload_length.
+          if (replay_item.tlps_pkt.Fmt[0] && payload_length > 0) begin
+            replay_item.tlps_pkt.Address = {buffer[data_index + 3], buffer[data_index + 4]};
+            replay_item.payload = new[payload_length - 1];
+            foreach (replay_item.payload[k]) replay_item.payload[k] = buffer[data_index + 5 + k];
           end
-          replay_item.tlp_pkt.push_back(buffer[data_index + 4 + payload_length]);  // LCRC
-
-          // Unpack to set seq_num, tlps_pkt, payload, etc.
-          replay_item.do_unpack_bytes();
-          replay_item.lcrc = replay_item.received_lcrc;
+          else begin
+            replay_item.tlps_pkt.Address = buffer[data_index + 3];
+            replay_item.payload = new[payload_length];
+            foreach (replay_item.payload[k]) replay_item.payload[k] = buffer[data_index + 4 + k];
+          end
           replay_item.do_pack_bytes();
           // Add to output queue
           items.push_back(replay_item);
@@ -327,6 +347,14 @@ class pcie_dl_seq_item extends uvm_sequence_item;
       device_replay_buffer[dev_id] = {};
     end
     buffer = device_replay_buffer[dev_id];
+  endfunction
+
+  // DL_Down: discard every TLP of this device in the replay buffer
+  static function void clear_replay_buffer_static(int dev_id);
+    device_replay_buffer[dev_id]      = {};
+    device_replay_count[dev_id]       = 0;
+    device_oldest_unacked_seq[dev_id] = 0;
+    device_next_tx_seq[dev_id]        = 0;
   endfunction
 
   static function int get_replay_count_static(int dev_id);
@@ -469,10 +497,14 @@ class pcie_dl_seq_item extends uvm_sequence_item;
     	tlp_header1 = {tlps_pkt.Fmt,tlps_pkt.Type,tlps_pkt.rsvd1,tlps_pkt.TC,tlps_pkt.rsvd2,tlps_pkt.attr1,tlps_pkt.rsvd3,tlps_pkt.TH,tlps_pkt.TD,tlps_pkt.EP,tlps_pkt.attr2,tlps_pkt.AT,tlps_pkt.length};
 //     tlp_header1 = {tlps_pkt.length, tlps_pkt.Address[63:42]};
     tlp_header2 = {tlps_pkt.sdw};
-    tlp_header3 = {tlps_pkt.Address};
+    // 3 DW header: DW2 = Address[31:0]
+    // 4 DW header (Fmt[0] = 1, 64-bit address): DW2 = Address[63:32], DW3 = Address[31:0]
+    tlp_header3 = tlps_pkt.Fmt[0] ? tlps_pkt.Address[63:32] : tlps_pkt.Address[31:0];
     tx_buffer.push_back(tlp_header1);
     tx_buffer.push_back(tlp_header2);
     tx_buffer.push_back(tlp_header3);
+    if (tlps_pkt.Fmt[0])
+      tx_buffer.push_back(tlps_pkt.Address[31:0]);
     foreach (payload[i]) 
       tx_buffer.push_back(payload[i]);    
   endfunction
@@ -591,14 +623,37 @@ class pcie_dl_seq_item extends uvm_sequence_item;
         dllps_pkt.crc16     = dllp_pkt[1][31:16];
       end
     end 
-    else begin // TLP
-      seq_num[11:0]=tlp_pkt[0][31:20];
-      tlps_pkt.length = tlp_pkt[0][19:10];
-      tlps_pkt.Address = {tlp_pkt[0][9:0], tlp_pkt[1], tlp_pkt[2][31:10]};
-      num_payload_dwords = tlps_pkt.length;
+    else begin // TLP: tlp_pkt = {seq DW, header (3 or 4 DW), payload..., LCRC}
+      int hdr_dws;
+      bit [31:0] h0;
+      seq_num[11:0] = tlp_pkt[0][31:20];
+      num_payload_dwords = 0;
+      if (tlp_pkt.size() >= 5) begin
+        h0 = tlp_pkt[1];
+        tlps_pkt.Fmt    = h0[31:29];
+        tlps_pkt.Type   = h0[28:24];
+        tlps_pkt.rsvd1  = h0[23];
+        tlps_pkt.TC     = h0[22:20];
+        tlps_pkt.rsvd2  = h0[19];
+        tlps_pkt.attr1  = h0[18];
+        tlps_pkt.rsvd3  = h0[17];
+        tlps_pkt.TH     = h0[16];
+        tlps_pkt.TD     = h0[15];
+        tlps_pkt.EP     = h0[14];
+        tlps_pkt.attr2  = h0[13:12];
+        tlps_pkt.AT     = h0[11:10];
+        tlps_pkt.length = h0[9:0];
+        tlps_pkt.sdw    = tlp_pkt[2];
+        hdr_dws = h0[29] ? 4 : 3;
+        if (hdr_dws == 4 && tlp_pkt.size() >= 6) tlps_pkt.Address = {tlp_pkt[3], tlp_pkt[4]};
+        else                                     tlps_pkt.Address = tlp_pkt[3];
+        // payload = everything between the header and the LCRC
+        num_payload_dwords = tlp_pkt.size() - 2 - hdr_dws;
+        if (num_payload_dwords < 0) num_payload_dwords = 0;
+      end
       payload = new[num_payload_dwords];
       for (int i = 0; i < num_payload_dwords; i++)
-        payload[i] = tlp_pkt[3 + i];
+        payload[i] = tlp_pkt[1 + hdr_dws + i];
     end
     received_lcrc = tlp_pkt[tlp_pkt.size()-1];
   endfunction

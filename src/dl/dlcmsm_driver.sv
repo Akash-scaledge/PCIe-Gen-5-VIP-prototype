@@ -29,6 +29,16 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   int pd_cost;
   bit ph_ok, pd_ok;
 
+  // --- Flow-control initialisation / credit gating ---
+  // Index 0 = Posted, 1 = Non-Posted, 2 = Completion
+  bit  fc_init_rcvd[3];            // FC_INIT1: credits recorded for this type (from InitFC1 or InitFC2)
+  bit  tx_fc_hdr_inf[3];           // partner advertised infinite header credits (HdrFC = 0 in InitFC)
+  bit  tx_fc_data_inf[3];          // partner advertised infinite data credits (DataFC = 0 in InitFC)
+  int  initfc_resend_cycles = 200; // InitFC1/InitFC2 repeat interval in clocks (spec: at least every 34 us; LTSSM_1MS = 250 clocks here)
+  int  initfc_idle_cycles   = 0;   // cycles since the last InitFC DLLP was sent
+  pcie_dl_seq_item initfc_sent[bit [7:0]]; // last InitFC DLLP sent, per DLLP type (used for resends)
+  bit  dlf_ack_sent = 0;           // a Data Link Feature DLLP with Feature Ack = 1 has been sent
+
   process pr[2];
 
   bit send_tlp;int cntr_tlp;
@@ -95,10 +105,33 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   // NEW: Replay mode flag and queue for replayed TLPs
   bit replay_mode = 0;  // Flag to indicate if replay is active
   pcie_dl_seq_item replay_queue[$];  // Queue to hold TLPs for replay
+  bit replay_requested = 0;  // Nak / REPLAY_TIMER expiry during a replay: replay again when it is done
 
   // Device-specific sequence tracking
   bit [11:0] my_device_tx_seq_num = 0;bit f_rcd;
   int i;
+
+  // Transmit arbiter bookkeeping (see dlcmsm_tx)
+  bit fc_wait_reported = 0;  // FC_WAIT/separation message already printed for the TLP at the queue head
+  bit seq_tlp_warned   = 0;  // warning about TLP items from the DL sequence already printed
+
+  // --- Receiver flow control (credits this device advertised to the partner) ---
+  // Index 0 = Posted, 1 = Non-Posted, 2 = Completion. Unscaled credit units.
+  int  rx_fc_hdr_alloc[3];    // CREDITS_ALLOCATED: last header value advertised (InitFC/UpdateFC)
+  int  rx_fc_data_alloc[3];
+  int  rx_fc_hdr_rcvd[3];     // CREDITS_RECEIVED
+  int  rx_fc_data_rcvd[3];
+  bit  rx_fc_hdr_inf[3];      // infinite credits advertised (0 in InitFC)
+  bit  rx_fc_data_inf[3];
+  bit  rx_fc_init_seen[3];    // InitFC values of this type captured
+  bit  rx_fc_scaled[3];       // advertised with a scale factor > 1: overflow check not done
+  bit  rx_fc_dirty[3];        // credits freed, UpdateFC pending
+
+  // --- DL_Down handling ---
+  bit     dl_force_down = 0;  // test hook: behave as if LinkUp = 0
+  bit     dl_down_done  = 0;  // DL_Down handled, waiting for LinkUp
+  int     dl_down_count = 0;
+  process rx_proc;            // dlcmsm_rx thread, restarted after a DL_Down
 
   //--------------------------------------------------------------------------
   // Register callback class for driver packet modification
@@ -260,7 +293,9 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     fork
       update_fsm();              // FSM transition monitoring
       dlcmsm_tx(phase);               // Main transmit path (TLP/DLLP)
-      dlcmsm_rx();               // Main receive path
+      dlcmsm_rx_restartable();   // Main receive path (restarted after a DL_Down)
+      dl_link_monitor();         // LinkUp / reset -> DL_Down handling
+      rx_fc_updater();           // UpdateFC for credits freed by the receiver
       acknak_timer_manager();    // ACK/NAK latency tracking
       handle_acknak_requests();  // ACK/NAK generation and dispatch
       monitor_replay_timer();    // Replay timeout detection and handling
@@ -275,6 +310,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   //   partner DLF DLLPs as per PCIe Data Link Feature Exchange protocol.
   //--------------------------------------------------------------------------
   task dlcmsm_tx_dlf();
+    dlf_ack_sent = 0;
     while(fsm.curr_state == DL_FEATURE) begin
       pcie_dl_seq_item req;
 
@@ -310,6 +346,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                   $sformatf("SENDING DL FEATURE DLLP=%p",req.dllp_pkt),
                   UVM_NONE)
         drive(req);
+        if (req.dllps_f_pkt.feature_ack) dlf_ack_sent = 1;
       end
 
       // Complete sequence item handshake
@@ -375,11 +412,12 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
           // CRC validation
           if(comp_crc==rx_dword[31:16]) begin
             cfg.dl_feature_sprt_valid   = 1'b1;
-            cfg.remote_feature_support = rx_item.dllp_pkt[1][22:0];
+            // rx_item.dllp_pkt holds no SDP marker: [0] = DLF DW, [1] = CRC DW
+            cfg.remote_feature_support = rx_item.dllp_pkt[0][22:0];
             cfg.scaled_flow_control_spprt = scl_en;
 
-            // Update remote feature status register
-            reg_model.remote_f_reg.set({1'b1,30'b0,scl_en});
+            // Update remote feature status register: [31] valid, [22:0] remote feature support
+            reg_model.remote_f_reg.set({1'b1, 8'b0, rx_item.dllp_pkt[0][22:0]});
             remote_data = reg_model.remote_f_reg.get();
 
             `uvm_info(get_type_name(),
@@ -398,9 +436,14 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                                  rx_item.dllp_pkt,comp_crc))
           end
 
-          // Trigger FSM transition based on ACK bit
-          fsm.go_init = f_ack;
-          fsm.update_state();
+          // Leave DL_FEATURE when the partner acknowledged our feature DLLP and
+          // we have already sent an acknowledging DLLP ourselves (otherwise the
+          // partner, now with its own DLCMSM, could wait forever for our Ack).
+          // A DLLP with a bad CRC is discarded and never moves the FSM.
+          if (comp_crc == rx_dword[31:16] && f_ack && dlf_ack_sent) begin
+            fsm.go_init = 1;
+            fsm.update_state();
+          end
         end
 
         //------------------------------------------------------------------
@@ -472,10 +515,11 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                      $sformatf("Device %0d: REPLAY_TIMER expired! Initiating replay",
                                cfg.device_id));
 
-        handle_replay_timer_expiration();
-
+        // clear first: the replay below restarts the timer
         replay_timer_running = 0;
         replay_timer.done_flag = 0;
+
+        handle_replay_timer_expiration();
       end
     end
   endtask
@@ -483,30 +527,49 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
 
   //--------------------------------------------------------------------------
   // Replay Timer Expiration Handler
-  // Description:
-  //   - Increments REPLAY_NUM
-  //   - Initiates replay or forces link retrain on overflow
+  //   Spec: replay every unacknowledged TLP (see start_replay)
   //--------------------------------------------------------------------------
   task handle_replay_timer_expiration();
-    REPLAY_NUM = REPLAY_NUM + 1;
+    start_replay("REPLAY_TIMER expired");
+  endtask
 
-    `uvm_info("REPLAY_TIMER",
-              $sformatf("Device %0d: REPLAY_NUM incremented to %0d",
-                        cfg.device_id, REPLAY_NUM),
-              UVM_LOW);
 
-    // After 4 failed replay attempts, force link retrain
-    if (REPLAY_NUM == 2'b00) begin // rollover from 11b to 00b
+  //--------------------------------------------------------------------------
+  // Task: start_replay
+  //   Common replay entry for Nak and REPLAY_TIMER expiry:
+  //   - a replay already in progress is finished first; one more replay is
+  //     then started (replay_requested)
+  //   - nothing to replay -> nothing to do
+  //   - REPLAY_NUM is incremented; on rollover 11b -> 00b the Physical Layer
+  //     must retrain the link (not modelled yet: uvm_error only)
+  //   - every TLP not yet acknowledged is replayed, oldest first
+  //     (from ACKD_SEQ + 1), and REPLAY_TIMER is restarted
+  //--------------------------------------------------------------------------
+  task start_replay(string reason);
+    bit [11:0] from_seq;
+    if (replay_mode) begin
+      replay_requested = 1;
+      `uvm_info("REPLAY", $sformatf("Device %0d: %s during a replay - will replay again after the current one", cfg.device_id, reason), UVM_LOW);
+      return;
+    end
+    if (pcie_dl_seq_item::get_replay_count_static(cfg.device_id) == 0) begin
+      `uvm_info("REPLAY", $sformatf("Device %0d: %s - replay buffer empty, nothing to replay", cfg.device_id, reason), UVM_LOW);
+      stop_replay_timer();
+      return;
+    end
+    if (REPLAY_NUM == 2'b11) begin
       `uvm_error("REPLAY_TIMER",
-                 $sformatf("Device %0d: REPLAY_NUM overflow! 4 failed attempts - forcing link retrain",
-                           cfg.device_id));
+                 $sformatf("Device %0d: REPLAY_NUM rollover (11b -> 00b) on %s - 4 replays without forward progress",
+                           cfg.device_id, reason));
       force_link_retrain();
     end
-    else begin
-      // Replay outstanding unacknowledged TLPs
-      initiate_buffer_replay();
-      start_replay_timer();
-    end
+    REPLAY_NUM = REPLAY_NUM + 1;
+    from_seq = ACKD_SEQ + 12'd1;   // oldest unacknowledged TLP
+    `uvm_info("REPLAY", $sformatf("Device %0d: %s - replaying from seq_num %0d, REPLAY_NUM=%0d",
+                                  cfg.device_id, reason, from_seq, REPLAY_NUM), UVM_LOW);
+    initiate_buffer_replay(from_seq);
+    stop_replay_timer();
+    start_replay_timer();
   endtask
 
   // Utility Functions
@@ -520,10 +583,29 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     return (diff >= 2048);
   endfunction
 
+  // Spec: on REPLAY_NUM rollover the Physical Layer retrains the link and the
+  // replay follows. Retrain is not modelled yet: report it and go on with the
+  // replay so the simulation continues.
   task force_link_retrain();
-    `uvm_error("LINK_RETRAIN", $sformatf("Device %0d: Forcing link retrain due to REPLAY_NUM overflow", cfg.device_id));
-    // Implementation would signal Physical Layer to enter Recovery state
+    `uvm_error("LINK_RETRAIN", $sformatf("Device %0d: REPLAY_NUM rollover - link retrain required (not modelled; replay continues)", cfg.device_id));
   endtask
+
+  // AckNak_Seq_Num must be ACKD_SEQ or the sequence number of an
+  // unacknowledged TLP; anything else is a Data Link protocol error.
+  function bit acknak_seq_valid(bit [11:0] seq);
+    bit [11:0] d, outstanding;
+    d           = seq - ACKD_SEQ;
+    outstanding = NEXT_TRANSMIT_SEQ - 12'd1 - ACKD_SEQ;   // TLPs sent but not acknowledged
+    return (d <= outstanding);
+  endfunction
+
+  // TLP with sequence number seq is still unacknowledged
+  function bit seq_unacked(bit [11:0] seq);
+    bit [11:0] d, outstanding;
+    d           = seq - ACKD_SEQ;
+    outstanding = NEXT_TRANSMIT_SEQ - 12'd1 - ACKD_SEQ;
+    return (d != 0 && d <= outstanding);
+  endfunction
 
   task initiate_buffer_replay(bit [11:0] start_seq_num = 0);
     pcie_dl_seq_item replay_items[$];
@@ -548,6 +630,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   //Update state each clock cycle
   task update_fsm();
     fork
+      initfc_retransmit();
       begin forever begin
         @(posedge vif.clk);
         fsm.update_state();
@@ -559,6 +642,62 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
         `uvm_info(get_type_name(), $sformatf("Device %0d: DLCMSM state change from %s to %s", cfg.device_id, cfg.last_state, cfg.curr_state), UVM_LOW);
       end end
     join
+  endtask
+
+
+  //--------------------------------------------------------------------------
+  // Task: initfc_retransmit
+  //   Spec (FC_INIT1/FC_INIT2): InitFC1 (resp. InitFC2) DLLPs for P, NP and
+  //   Cpl are sent in that order and repeated at least every 34 us until the
+  //   state is left. The DL sequence sends each set once, so a single lost or
+  //   corrupted DLLP used to hang initialisation. If no InitFC DLLP was sent
+  //   for initfc_resend_cycles, the set for the current state is sent again,
+  //   with the credit values the sequence used.
+  //   Also clears the FC_INIT1 bookkeeping whenever the DLCMSM is not in
+  //   flow-control initialisation or DL_ACTIVE (e.g. after a DL_Down).
+  //--------------------------------------------------------------------------
+  task initfc_retransmit();
+    forever begin
+      @(posedge vif.clk);
+      if (!(fsm.curr_state inside {FC_INIT1, FC_INIT2, DL_ACTIVE})) begin
+        fc_init_rcvd = '{0, 0, 0};
+      end
+      if (!(fsm.curr_state inside {FC_INIT1, FC_INIT2})) begin
+        initfc_idle_cycles = 0;
+        continue;
+      end
+      initfc_idle_cycles++;
+      if (initfc_idle_cycles < initfc_resend_cycles) continue;
+      initfc_idle_cycles = 0;
+      resend_initfc(fsm.curr_state == FC_INIT1);
+    end
+  endtask
+
+  task resend_initfc(bit fc1);
+    bit [7:0] t1[3];
+    bit [7:0] t2[3];
+    pcie_dl_seq_item src, req;
+    t1 = '{INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0};
+    t2 = '{INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0};
+    for (int c = 0; c < 3; c++) begin
+      // InitFC1 and InitFC2 of one credit type carry the same credit values
+      src = null;
+      if (initfc_sent.exists(fc1 ? t1[c] : t2[c]))      src = initfc_sent[fc1 ? t1[c] : t2[c]];
+      else if (initfc_sent.exists(fc1 ? t2[c] : t1[c])) src = initfc_sent[fc1 ? t2[c] : t1[c]];
+      if (src == null) continue;   // the sequence never advertised this type: nothing to repeat
+      req = pcie_dl_seq_item::type_id::create("initfc_resend");
+      req.device_id = cfg.device_id;
+      req.is_tlp = 0;
+      req.is_nop = 0;
+      req.is_pm  = 0;
+      req.acknak_pkt.dllp_type = ACK_DLLP_TYPE;   // 0: not an Ack/Nak
+      req.dllps_pkt = src.dllps_pkt;
+      req.dllps_pkt.dllp_type = dllp_type_e'(fc1 ? t1[c] : t2[c]);
+      `uvm_info(get_type_name(), $sformatf("Device %0d: %s - repeating %s (HdrFC=%0d DataFC=%0d)",
+                                           cfg.device_id, fsm.curr_state.name(), req.dllps_pkt.dllp_type.name(),
+                                           req.dllps_pkt.HdrFC, req.dllps_pkt.DataFC), UVM_LOW)
+      send_dllp(req);
+    end
   endtask
 
   task collect_tlps(uvm_phase phase);
@@ -591,320 +730,531 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
 
 
 
-  // Enhanced TX task 
+  //--------------------------------------------------------------------------
+  // Task: dlcmsm_tx  (transmit arbiter)
+  // Description:
+  //   Each pass picks ONE packet to send, in the order of the PCIe Base Spec
+  //   transmit-priority implementation note (Data Link Layer):
+  //     1. ACK/NAK DLLPs                      (acknak_req_fifo)
+  //     2. Replay of unacknowledged TLPs      (replay_queue)
+  //     3. New TLPs from the Transaction Layer (dl_tlp_queue), if FC credits allow
+  //     4. DLLPs from the DL sequence (InitFC/UpdateFC/NOP/PM), via try_next_item
+  //   TLPs from the TL are sent by the driver itself, so the DL sequence no
+  //   longer has to provide "TLP slot" items. The TL, DL and PL sequences are
+  //   independent of each other.
+  //   try_next_item never blocks, so a finished DL sequence can no longer stop
+  //   ACK/NAK or replay traffic (this was the "ACK never sent" bug).
+  //--------------------------------------------------------------------------
   task dlcmsm_tx(uvm_phase phase);
+    pcie_dl_seq_item req;
+    bit tlp_sent;
+
     fork
       collect_tlps(phase);
     join_none
 
     forever begin
-      pcie_dl_seq_item req;
+      req = null;
 
-
-      // Check for ACK/NAK requests first (unchanged)
-      if (acknak_req_fifo.used() > 0) begin
-
-        acknak_req_fifo.get(req); 
-
-
-        is_acknak_req = 1; 
-        `uvm_info(get_type_name(), $sformatf("Device %0d: Processing ACK/NAK request from FIFO", cfg.device_id), UVM_LOW);
-      end
-      else begin
-        // NEW: If replay mode is active and replay_queue has items, send from replay_queue instead of sequencer
-        if (replay_mode && replay_queue.size() > 0) begin
-          req = replay_queue.pop_front();  // Get next replay TLP
-          is_acknak_req = 0;
-          `uvm_info(get_type_name(), $sformatf("Device %0d: Sending replay TLP seq_num %0d from replay_queue", cfg.device_id, req.seq_num), UVM_LOW);
-        end
-        else if (!replay_mode) begin
-          // Normal mode: Get new item from sequencer
-
-          wait(fsm.curr_state inside {FC_INIT1, FC_INIT2, DL_ACTIVE});
-
-
-          seq_item_port.get_next_item(req);
-          
-
-          is_acknak_req = 0;
-        end
-        else begin
-          // Replay mode but queue empty: Wait for next clock (replay completion will reset mode)
-          @(posedge vif.clk);
-          continue;
-        end
-      end
-
-      req.device_id = cfg.device_id;
-
-      // State-based filtering for regular DLLPs (not ACK/NAK) (unchanged)
-      if (!req.is_tlp && !(req.acknak_pkt.dllp_type inside {ACK_DLLP_TYPE, NAK_DLLP_TYPE})) begin
-        case (fsm.curr_state)
-          FC_INIT1: if (!(req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0})) begin
-            `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked non-INITFC1 DLLP (%s) in FC_INIT1", cfg.device_id, req.dllps_pkt.dllp_type.name()));
-            if (!is_acknak_req) seq_item_port.item_done(); 
-            continue;
-          end
-          FC_INIT2: if (req.dllps_pkt.dllp_type inside {INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
-            if (fsm.curr_state != FC_INIT2 || fsm.go_active) begin
-              `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked INITFC2 DLLP from TX in state %s", cfg.device_id, fsm.curr_state.name()));
-              if (!is_acknak_req) seq_item_port.item_done(); 
-              continue; 
-            end
-          end
-          DL_ACTIVE: begin
-            if (req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
-                                                INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
-              `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked INITFC DLLP (%s) in DL_ACTIVE", cfg.device_id, req.dllps_pkt.dllp_type.name()));
-              if (!is_acknak_req) seq_item_port.item_done(); 
-              continue;
-            end
-            if (!(req.dllps_pkt.dllp_type inside {UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0,NOP,PM_Enter_L1,PM_Enter_L23,PM_Active_State_Request_L1,PM_Request_Ack})) begin
-              `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked restricted DLLP (%s) in DL_ACTIVE", cfg.device_id, req.dllps_pkt.dllp_type.name()));
-              if (!is_acknak_req) seq_item_port.item_done(); 
-              continue;
-            end
-          end
-        endcase
-      end
-
-      // Block TLPs in non-DL_ACTIVE state (unchanged)
-      if (req.is_tlp && fsm.curr_state != DL_ACTIVE) begin
-        `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked TLP in non-DL_ACTIVE state", cfg.device_id));
-        if (!is_acknak_req) seq_item_port.item_done(); 
+      // Nothing is transmitted before flow-control initialisation starts
+      if (!(fsm.curr_state inside {FC_INIT1, FC_INIT2, DL_ACTIVE})) begin
+        @(posedge vif.clk);
         continue;
       end
 
+      //------------------------------------------------------------------
+      // 1. ACK / NAK DLLPs
+      //------------------------------------------------------------------
+      if (acknak_req_fifo.used() > 0) begin
+        acknak_req_fifo.get(req);
+        is_acknak_req = 1;
+        `uvm_info(get_type_name(), $sformatf("Device %0d: Processing ACK/NAK request from FIFO", cfg.device_id), UVM_LOW);
+        send_dllp(req);
+        is_acknak_req = 0;
+        continue;
+      end
+      is_acknak_req = 0;
 
-      if (!req.is_tlp && fsm.curr_state == DL_ACTIVE && (req.dllps_pkt.dllp_type inside {UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0})) begin
-        //         timer_uvm update_timer;
-        //         update_timer.start_timer(LTSMM_UPDATE,"Update_timer");
-        `uvm_info(get_type_name(),"inside UPDATEFC transmission",UVM_NONE);
-        ph_cost = 1; 
-        pd_cost = (req.tlps_pkt.length + 3) / 4; 
-
-        // Blocking Wait for Credits (using 2's complement modulo arithmetic)
-        // We assume Posted (Memory Write) for generic TLPs here. 
-        // If you support reads, you need a case statement on req.tlps_pkt.Fmt/Type.
-
-        // WAIT LOOP
-        //         fork
-
-
-        while (1) begin
-          ph_ok = ( (tx_ph_limit - tx_ph_consumed) ) >= ph_cost;
-          //             $display("ph %0d %0d",tx_ph_limit, tx_ph_consumed);
-
-          pd_ok = ( (tx_pd_limit - tx_pd_consumed) ) >= pd_cost;
-          //             $display("pd %0d %0d",tx_pd_limit, tx_pd_consumed);
-
-          if ((ph_ok && pd_ok) || update_timer.done_flag)begin
-            if(ph_ok && pd_ok) begin
-              `uvm_info("CREDIT_OK", "Enough Credits Available, Exit While LOOP", UVM_NONE);
-              send_tlp=1;
-            end
-            //               else begin
-            //                 `uvm_info("CREDIT_TIMER_RUNOUT", "Update timer Ran out", UVM_NONE);
-            //                 send_tlp=0;
-            //               end
-            break; // We have enough credits! Exit loop.
-          end
-
-          // Not enough credits, wait for next clock and check again (Receive updates happen in parallel)
-          `uvm_info("FC_WAIT", $sformatf("Device %0d Waiting for Credits. Need PH:%0d PD:%0d. Have PH_Room:%0d PD_Room:%0d", 
-                                         cfg.device_id, ph_cost, pd_cost, 
-                                         (tx_ph_limit - tx_ph_consumed), 
-                                         (tx_pd_limit - tx_pd_consumed)), UVM_NONE);
-          //             $display("##################################################################################################################");
-          @(posedge vif.clk);
+      //------------------------------------------------------------------
+      // 2. Replay of unacknowledged TLPs (no new TLPs until replay is done)
+      //------------------------------------------------------------------
+      if (replay_mode) begin
+        if (replay_queue.size() > 0) begin
+          req = replay_queue.pop_front();
+          if (seq_unacked(req.seq_num))
+            send_replay_tlp(req, phase);
+          else
+            `uvm_info("REPLAY", $sformatf("Device %0d: seq_num %0d was acknowledged during the replay - not resent", cfg.device_id, req.seq_num), UVM_LOW)
         end
-
-        //         join_none
-        //         $display("okhayyy, lets gooo %0d %0d %0d %0d",ph_ok, pd_ok, tx_ph_limit, tx_ph_consumed, tx_pd_limit, tx_pd_consumed);
-
-        //         if (!is_acknak_req) seq_item_port.item_done();
-      end
-
-      //TLP transmission
-      if(req.is_tlp && fsm.curr_state == DL_ACTIVE && send_tlp && dl_tlp_queue.size()>=0 ) begin
-
-        wait(dl_tlp_queue.size()>0);
-
-        //         if(i==0) phase.raise_objection(this);
-        //         i++;
-//         $display("%0d *********************************IFPART********************************** ",dl_tlp_queue.size());
-      end
-      //       if(cntr_tlp == `NUM_TLPS_TO_SEND) phase.drop_objection(this);
-      //       else begin
-
-      //         if(req.is_tlp && fsm.curr_state == DL_ACTIVE && send_tlp && dl_tlp_queue.size()>0 )begin
-      //           phase.raise_objection(this);
-      //           $display("%0d ****************************ELSEPART*********************************** ",dl_tlp_queue.size());
-      //         end
-      //       end
-      if (req.is_tlp && fsm.curr_state == DL_ACTIVE && send_tlp && dl_tlp_queue.size()>0 ) begin
-        //         dl_driver_get_tl_port.get(dl_getting_que);
-        //         $display("SUCCESS RECIEVED FROM TL");
-        //         dl_tlp_queue.push_back(dl_getting_que);
-        //         `uvm_info("COLLECTION_TL_2_DL",$sformatf("PKT RECIEVED=%p   Que_size=%0d",dl_getting_que,dl_tlp_queue.size()),UVM_NONE);
-        //         foreach(dl_getting_que[i])
-        //           $display("%h ",dl_getting_que[i]);
-        `uvm_info(get_type_name(),"inside TLP transmission",UVM_NONE);
-        phase.raise_objection(this);
-        dl_q=dl_tlp_queue.pop_front();
-
-//         `uvm_info(get_full_name,$sformatf("Fmt=%0h",dl_q[0][31:29]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("Type=%0h",dl_q[0][28:24]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("rsvd1=%0h",dl_q[0][23]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("TC=%0h",dl_q[0][22:20]),UVM_NONE); 
-//         `uvm_info(get_full_name,$sformatf("rsvd2=%0h",dl_q[0][19]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("attr1=%0h",dl_q[0][18]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("rsvd3=%0h",dl_q[0][17]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("TH=%0h",dl_q[0][16]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("TD=%0h",dl_q[0][15]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("EP=%0h",dl_q[0][14]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("attr2=%0h",dl_q[0][13:12]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("AT=%0h",dl_q[0][11:10]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("length=%0h",dl_q[0][9:0]),UVM_NONE);
-//         `uvm_info(get_full_name,$sformatf("Address=%0h",dl_q[2]),UVM_NONE);
-        req.tlps_pkt.Fmt=		dl_q[0][31:29];
-        req.tlps_pkt.Type=		dl_q[0][28:24];
-        req.tlps_pkt.rsvd1=		dl_q[0][23];
-        req.tlps_pkt.TC=		dl_q[0][22:20]; 
-        req.tlps_pkt.rsvd2=		dl_q[0][19];
-        req.tlps_pkt.attr1=		dl_q[0][18];
-        req.tlps_pkt.rsvd3=		dl_q[0][17];
-        req.tlps_pkt.TH=		dl_q[0][16];
-        req.tlps_pkt.TD=		dl_q[0][15];
-        req.tlps_pkt.EP=		dl_q[0][14];
-        req.tlps_pkt.attr2=		dl_q[0][13:12];
-        req.tlps_pkt.AT=		dl_q[0][11:10];
-        req.tlps_pkt.length=	dl_q[0][9:0];
-        req.tlps_pkt.sdw=		dl_q[1];
-        req.tlps_pkt.Address=	dl_q[2];
-        //         req.payload.delete();
-//         req.payload=new[dl_q.size()-3](dl_q[3:$]);
-        req.payload = new[dl_q.size()-3];
-        foreach (req.payload[i]) req.payload[i] = dl_q[i+3];
-//         $display("################################################################");
-//         $display("%p",req.tlps_pkt);
-        req.from_TL=1;
-
-        // NEW: For replay TLPs, skip counter separation check and sequence number assignment (use stored seq_num)
-        if (!replay_mode) begin
-          // Check counter separation (only for new TLPs)
-          if (is_counter_separation_too_large()) begin
-            `uvm_warning(get_type_name(), $sformatf("Device %0d: Cannot send TLP - counter separation >= 2048. NEXT_TRANSMIT_SEQ='h%h, ACKD_SEQ='h%h", 
-                                                    cfg.device_id, NEXT_TRANSMIT_SEQ, ACKD_SEQ));
-            if (!is_acknak_req) seq_item_port.item_done();
-            continue;
-          end
-
-          //Assign sequence number using NEXT_TRANSMIT_SEQ (only for new TLPs)
-          req.assign_sequence_number(NEXT_TRANSMIT_SEQ);
-          NEXT_TRANSMIT_SEQ = (NEXT_TRANSMIT_SEQ + 1) % 4096;
-
-          // Pack and store (only for new TLPs)
-          req.do_pack_bytes();
-          req.store_in_replay_buffer(cfg.device_id);
-
-          //REPLAY_TIMER management - start when TLP sent (only for new TLPs)
-          if (!replay_timer_running) begin
-            start_replay_timer();
+        if (replay_queue.size() == 0) begin
+          replay_mode = 0;
+          `uvm_info("REPLAY", $sformatf("Device %0d: Replay completed, exiting replay mode", cfg.device_id), UVM_LOW);
+          if (replay_requested) begin
+            replay_requested = 0;
+            start_replay("Nak/REPLAY_TIMER during the previous replay");
           end
         end
-        else begin
-          // For replay TLPs: Use stored sequence number, no need to pack/store again
-          // Data is already packed from get_replay_buffer_items
+        continue;
+      end
+
+      //------------------------------------------------------------------
+      // 3. New TLP from the Transaction Layer
+      //------------------------------------------------------------------
+      if (fsm.curr_state == DL_ACTIVE && dl_tlp_queue.size() > 0) begin
+        send_tl_tlp(phase, tlp_sent);
+        if (tlp_sent) continue;
+      end
+
+      //------------------------------------------------------------------
+      // 4. DLLP from the DL sequence (non-blocking)
+      //------------------------------------------------------------------
+      seq_item_port.try_next_item(req);
+      if (req != null) begin
+        req.device_id = cfg.device_id;
+        if (req.is_tlp) begin
+          // TLPs come from the Transaction Layer now. TLP items from the DL
+          // sequence (old "TLP slots") are not needed and are ignored.
+          if (!seq_tlp_warned) begin
+            `uvm_warning(get_type_name(), $sformatf("Device %0d: TLP item from the DL sequence ignored - TLPs are taken from the Transaction Layer queue", cfg.device_id));
+            seq_tlp_warned = 1;
+          end
         end
-
-        `uvm_info(get_type_name(),
-                  $sformatf("Device %0d Sent TLP: [Identifier=%h] | [length=%0d] | [address='h%h] | [seq_num=%0d] | [payload=%p] | [LCRC='h%h] | NEXT_TRANSMIT_SEQ='h%h",
-                            cfg.device_id, req.dllp_pkt[0], req.tlps_pkt.length, req.tlps_pkt.Address, req.seq_num, req.payload, req.lcrc, NEXT_TRANSMIT_SEQ), UVM_LOW);
-        // 3. Update Consumption (Spend the credits) - Done for both new and replay TLPs
-        tx_ph_consumed = (tx_ph_consumed + ph_cost) & 8'hFF;     // Wrap at 8 bits
-        tx_pd_consumed = (tx_pd_consumed + pd_cost) & 12'hFFF;   // Wrap at 12 bits
-
-        `uvm_info("FC_SPEND", $sformatf("Device %0d Spent Credits. New Consumed: PH=%0d PD=%0d", 
-                                        cfg.device_id, tx_ph_consumed, tx_pd_consumed), UVM_MEDIUM);
-      end
-      else begin
-        req.do_pack_bytes();
-      end
-
-
-      // STATE-BASED LOGGING for DLLPs (unchanged)
-      if (!req.is_tlp) begin
-        req.dllp_pkt.push_front(32'hDEADBEEA);
-        case (fsm.curr_state)
-          FC_INIT1: if (req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0}) begin
-            `uvm_info(get_type_name(),
-                      $sformatf("Device %0d Sent DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:1",
-                                cfg.device_id, req.dllps_pkt.dllp_type, req.dllps_pkt.dllp_type.name(), 
-                                req.dllps_pkt.rsvd1, req.dllps_pkt.HdrFC, req.dllps_pkt.rsvd2, req.dllps_pkt.DataFC), UVM_LOW);
-          end
-          FC_INIT2: if (req.dllps_pkt.dllp_type inside {INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
-            `uvm_info(get_type_name(),
-                      $sformatf("Device %0d Sent DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:1",
-                                cfg.device_id, req.dllps_pkt.dllp_type, req.dllps_pkt.dllp_type.name(), 
-                                req.dllps_pkt.rsvd1, req.dllps_pkt.HdrFC, req.dllps_pkt.rsvd2, req.dllps_pkt.DataFC), UVM_LOW);
-          end
-          DL_ACTIVE: begin
-            if (req.acknak_pkt.dllp_type inside {ACK_DLLP_TYPE, NAK_DLLP_TYPE}) begin
-              if (is_acknak_req) begin
-                `uvm_info(get_type_name(),
-                          $sformatf("Device %0d Sent BATCHED ACK/NAK DLLP: [dllp_type: %0h %s] | [rsvd:'h%0h] | [seq_num:%0d] | [crc16:'h%0h]",
-                                    cfg.device_id, req.acknak_pkt.dllp_type, req.acknak_pkt.dllp_type.name(), 
-                                    req.acknak_pkt.rsvd, req.acknak_pkt.seq_num, req.acknak_pkt.crc16), UVM_LOW);
-              end
-            end
-            if (req.dllps_pkt.dllp_type inside {UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0}) begin
-              `uvm_info(get_type_name(),
-                        $sformatf("Device %0d Sent DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:1",
-                                  cfg.device_id, req.dllps_pkt.dllp_type, req.dllps_pkt.dllp_type.name(), 
-                                  req.dllps_pkt.rsvd1, req.dllps_pkt.HdrFC, req.dllps_pkt.rsvd2, req.dllps_pkt.DataFC), UVM_LOW);
-            end
-            /////////////////////////////////////////changes for NOP and PM///////////////////////////////////////////
-            if (req.is_nop) begin
-              `uvm_info(get_type_name(),
-                        $sformatf("Device %0d Sent DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:1",
-                                  cfg.device_id, req.dllps_pkt.dllp_type, req.dllps_pkt.dllp_type.name(), 
-                                  req.dllps_pkt.rsvd1, req.dllps_pkt.HdrFC, req.dllps_pkt.rsvd2, req.dllps_pkt.DataFC), UVM_LOW);
-            end
-            /////////////////////////////////for PM/////////////////////////////////////////////////////////////
-            //             if (req.pm_pkt.dllp_type inside {PM_Enter_L1,PM_Enter_L23,PM_Active_State_Request_L1,PM_Request_Ack}) begin            
-            if (req.is_pm) begin
-              `uvm_info(get_type_name(),
-                        $sformatf("Device %0d Sent Power Management DLLP: [dllp_type: %0h %s] | [rsvd:'h%0h] | [crc16:'h%0h]",
-                                  cfg.device_id, req.pm_pkt.dllp_type, req.pm_pkt.dllp_type.name(), 
-                                  req.pm_pkt.rsvd,req.pm_pkt.crc16), UVM_LOW);
-            end
-          end
-        endcase
-      end
-      // callback triggering to corrupt lcrc & for nack (unchanged)
-      `uvm_do_callbacks(dlcmsm_driver, pcie_dl_pkt_modify_callback, modify_item(req))
-
-
-      drive(req);
-      if(req.is_tlp)begin
-//         $display("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ %0d",cntr_tlp);
-        phase.drop_objection(this);
-
-      end
-
-      // NEW: If replay_queue is now empty, reset replay_mode
-      if (replay_mode && replay_queue.size() == 0) begin
-        replay_mode = 0;
-        `uvm_info("REPLAY", $sformatf("Device %0d: Replay completed, exiting replay mode", cfg.device_id), UVM_LOW);
-      end
-
-      if (!is_acknak_req && !replay_mode) begin  // NEW: Don't call item_done for replay TLPs
-
+        else if (dllp_allowed_in_state(req)) begin
+          send_dllp(req);
+        end
         seq_item_port.item_done();
+        continue;
       end
+
+      // Nothing to send this cycle
+      @(posedge vif.clk);
     end
   endtask
+
+
+  //--------------------------------------------------------------------------
+  // Function: dllp_allowed_in_state
+  //   State-based filtering of DLLPs coming from the DL sequence.
+  //   Note: the Ack DLLP type is 00h, and every sequence item has
+  //   acknak_pkt.dllp_type == 0, so the old check "acknak_pkt.dllp_type inside
+  //   {ACK, NAK}" matched EVERY item and the filter never ran. It also sent
+  //   the register-model write item (dlf_reg_adapter, all fields 0) on the
+  //   link as a junk "Ack seq 0". ACK/NAK DLLPs are generated by the driver
+  //   itself (acknak_req_fifo), so items without a DLLP type are completed
+  //   here without being sent.
+  //--------------------------------------------------------------------------
+  function bit dllp_allowed_in_state(pcie_dl_seq_item req);
+    if (req.dllps_pkt.dllp_type == ACK_DLLP_TYPE && !req.is_nop && !req.is_pm) begin
+      `uvm_info(get_type_name(), $sformatf("Device %0d: Sequence item without a DLLP type (register access) completed without sending", cfg.device_id), UVM_HIGH);
+      return 0;
+    end
+    if (req.is_nop) return 1;   // NOP DLLPs may be sent in any state
+    case (fsm.curr_state)
+      FC_INIT1: if (!(req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0})) begin
+        `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked non-INITFC1 DLLP (%s) in FC_INIT1", cfg.device_id, req.dllps_pkt.dllp_type.name()));
+        return 0;
+      end
+      FC_INIT2: if (req.dllps_pkt.dllp_type inside {INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
+        if (fsm.go_active) begin
+          `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked INITFC2 DLLP from TX in state %s", cfg.device_id, fsm.curr_state.name()));
+          return 0;
+        end
+      end
+      DL_ACTIVE: begin
+        if (req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
+                                            INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
+          `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked INITFC DLLP (%s) in DL_ACTIVE", cfg.device_id, req.dllps_pkt.dllp_type.name()));
+          return 0;
+        end
+        if (!(req.dllps_pkt.dllp_type inside {UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0,NOP,PM_Enter_L1,PM_Enter_L23,PM_Active_State_Request_L1,PM_Request_Ack})) begin
+          `uvm_warning(get_type_name(), $sformatf("Device %0d: Blocked restricted DLLP (%s) in DL_ACTIVE", cfg.device_id, req.dllps_pkt.dllp_type.name()));
+          return 0;
+        end
+      end
+    endcase
+    return 1;
+  endfunction
+
+
+  //--------------------------------------------------------------------------
+  // Task: send_dllp
+  //   Packs, logs and drives one DLLP (ACK/NAK, InitFC, UpdateFC, NOP, PM).
+  //--------------------------------------------------------------------------
+  task send_dllp(pcie_dl_seq_item req);
+    req.device_id = cfg.device_id;
+    if (!req.is_tlp && !req.is_nop && !req.is_pm &&
+        req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
+                                        INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
+      initfc_sent[req.dllps_pkt.dllp_type] = req;
+      initfc_idle_cycles = 0;
+    end
+    req.do_pack_bytes();
+    req.dllp_pkt.push_front(32'hDEADBEEA);
+
+    // STATE-BASED LOGGING for DLLPs (unchanged)
+    case (fsm.curr_state)
+      FC_INIT1: if (req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0}) begin
+        `uvm_info(get_type_name(),
+                  $sformatf("Device %0d Sent DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:1",
+                            cfg.device_id, req.dllps_pkt.dllp_type, req.dllps_pkt.dllp_type.name(),
+                            req.dllps_pkt.rsvd1, req.dllps_pkt.HdrFC, req.dllps_pkt.rsvd2, req.dllps_pkt.DataFC), UVM_LOW);
+      end
+      FC_INIT2: if (req.dllps_pkt.dllp_type inside {INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
+        `uvm_info(get_type_name(),
+                  $sformatf("Device %0d Sent DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:1",
+                            cfg.device_id, req.dllps_pkt.dllp_type, req.dllps_pkt.dllp_type.name(),
+                            req.dllps_pkt.rsvd1, req.dllps_pkt.HdrFC, req.dllps_pkt.rsvd2, req.dllps_pkt.DataFC), UVM_LOW);
+      end
+      DL_ACTIVE: begin
+        if (req.acknak_pkt.dllp_type inside {ACK_DLLP_TYPE, NAK_DLLP_TYPE}) begin
+          `uvm_info(get_type_name(),
+                    $sformatf("Device %0d Sent BATCHED ACK/NAK DLLP: [dllp_type: %0h %s] | [rsvd:'h%0h] | [seq_num:%0d] | [crc16:'h%0h]",
+                              cfg.device_id, req.acknak_pkt.dllp_type, req.acknak_pkt.dllp_type.name(),
+                              req.acknak_pkt.rsvd, req.acknak_pkt.seq_num, req.acknak_pkt.crc16), UVM_LOW);
+        end
+        else if (req.dllps_pkt.dllp_type inside {UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0}) begin
+          `uvm_info(get_type_name(),
+                    $sformatf("Device %0d Sent DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:1",
+                              cfg.device_id, req.dllps_pkt.dllp_type, req.dllps_pkt.dllp_type.name(),
+                              req.dllps_pkt.rsvd1, req.dllps_pkt.HdrFC, req.dllps_pkt.rsvd2, req.dllps_pkt.DataFC), UVM_LOW);
+        end
+        if (req.is_nop) begin
+          `uvm_info(get_type_name(),
+                    $sformatf("Device %0d Sent NOP DLLP", cfg.device_id), UVM_LOW);
+        end
+        if (req.is_pm) begin
+          `uvm_info(get_type_name(),
+                    $sformatf("Device %0d Sent Power Management DLLP: [dllp_type: %0h %s] | [rsvd:'h%0h] | [crc16:'h%0h]",
+                              cfg.device_id, req.pm_pkt.dllp_type, req.pm_pkt.dllp_type.name(),
+                              req.pm_pkt.rsvd,req.pm_pkt.crc16), UVM_LOW);
+        end
+      end
+    endcase
+
+    // callback hook (error injection: corrupt CRC, drop, modify ...)
+    `uvm_do_callbacks(dlcmsm_driver, pcie_dl_pkt_modify_callback, modify_item(req))
+    drive(req);
+  endtask
+
+
+  //--------------------------------------------------------------------------
+  // Task: send_replay_tlp
+  //   Re-sends one TLP from the replay buffer (sequence number, header, data
+  //   and LCRC are the stored ones; no new credits are consumed).
+  //--------------------------------------------------------------------------
+  task send_replay_tlp(pcie_dl_seq_item req, uvm_phase phase);
+    req.device_id = cfg.device_id;
+    `uvm_info(get_type_name(), $sformatf("Device %0d: Sending replay TLP seq_num %0d from replay_queue", cfg.device_id, req.seq_num), UVM_LOW);
+    phase.raise_objection(this);
+    `uvm_do_callbacks(dlcmsm_driver, pcie_dl_pkt_modify_callback, modify_item(req))
+    drive(req);
+    phase.drop_objection(this);
+  endtask
+
+
+  //--------------------------------------------------------------------------
+  // Task: send_tl_tlp
+  //   Takes the TLP at the head of dl_tlp_queue (DWORDs from the TL), checks
+  //   sequence-number separation and flow-control credits, then adds the
+  //   sequence number + LCRC, stores it in the replay buffer and drives it.
+  //   sent = 0 if the TLP has to wait (no credits / too many unACKed TLPs);
+  //   it then stays at the head of the queue and is retried later.
+  //--------------------------------------------------------------------------
+  task send_tl_tlp(uvm_phase phase, output bit sent);
+    pcie_dl_seq_item req;
+    global_que_t     q;
+    int              fc_type, hdr_cost, data_cost;
+    int              hdr_dws, exp_dws;
+
+    sent = 0;
+    q = dl_tlp_queue[0];
+
+    // Header is 4 DW when Fmt[0] = 1 (64-bit address), else 3 DW
+    hdr_dws = (q.size() > 0 && q[0][29]) ? 4 : 3;
+    if (q.size() < hdr_dws) begin
+      `uvm_error(get_type_name(), $sformatf("Device %0d: TLP from TL has only %0d DWORDs (need a %0d DW header) - dropped: %p", cfg.device_id, q.size(), hdr_dws, q));
+      q = dl_tlp_queue.pop_front();
+      return;
+    end
+
+    // Sequence number rule: no new TLP if NEXT_TRANSMIT_SEQ - ACKD_SEQ >= 2048
+    if (is_counter_separation_too_large()) begin
+      if (!fc_wait_reported) begin
+        `uvm_warning(get_type_name(), $sformatf("Device %0d: TLP waiting - counter separation >= 2048. NEXT_TRANSMIT_SEQ='h%h, ACKD_SEQ='h%h",
+                                                cfg.device_id, NEXT_TRANSMIT_SEQ, ACKD_SEQ));
+        fc_wait_reported = 1;
+      end
+      return;
+    end
+
+    // Flow-control credit check (Posted / Non-Posted / Completion)
+    get_tlp_fc_cost(q[0], fc_type, hdr_cost, data_cost);
+    if (!fc_credits_available(fc_type, hdr_cost, data_cost)) begin
+      if (!fc_wait_reported) begin
+        `uvm_info("FC_WAIT", $sformatf("Device %0d: TLP waiting for %s credits. Need H:%0d D:%0d",
+                                       cfg.device_id, fc_type_name(fc_type), hdr_cost, data_cost), UVM_LOW);
+        fc_wait_reported = 1;
+      end
+      return;
+    end
+    fc_wait_reported = 0;
+
+    q = dl_tlp_queue.pop_front();
+    `uvm_info(get_type_name(),"inside TLP transmission",UVM_NONE);
+    exp_dws = hdr_dws + (q[0][30] ? ((q[0][9:0] == 0) ? 1024 : q[0][9:0]) : 0);
+    if (q.size() != exp_dws)
+      `uvm_warning("TLP_FORMAT", $sformatf("Device %0d: TLP from TL has %0d DWORDs, header says %0d (%0d DW header, Length=%0d) - sent as received",
+                                           cfg.device_id, q.size(), exp_dws, hdr_dws, q[0][9:0]))
+
+    req = pcie_dl_seq_item::type_id::create("tl_tlp");
+    req.device_id = cfg.device_id;
+    req.is_tlp    = 1;
+    req.tlps_pkt.Fmt=		q[0][31:29];
+    req.tlps_pkt.Type=		q[0][28:24];
+    req.tlps_pkt.rsvd1=		q[0][23];
+    req.tlps_pkt.TC=		q[0][22:20];
+    req.tlps_pkt.rsvd2=		q[0][19];
+    req.tlps_pkt.attr1=		q[0][18];
+    req.tlps_pkt.rsvd3=		q[0][17];
+    req.tlps_pkt.TH=		q[0][16];
+    req.tlps_pkt.TD=		q[0][15];
+    req.tlps_pkt.EP=		q[0][14];
+    req.tlps_pkt.attr2=		q[0][13:12];
+    req.tlps_pkt.AT=		q[0][11:10];
+    req.tlps_pkt.length=	q[0][9:0];
+    req.tlps_pkt.sdw=		q[1];
+    if (hdr_dws == 4) req.tlps_pkt.Address = {q[2], q[3]};   // DW2 = Address[63:32], DW3 = Address[31:0]
+    else              req.tlps_pkt.Address = q[2];
+    req.payload = new[q.size()-hdr_dws];
+    foreach (req.payload[k]) req.payload[k] = q[k+hdr_dws];
+    req.from_TL=1;
+
+    // Assign sequence number, add LCRC, keep a copy for replay
+    req.assign_sequence_number(NEXT_TRANSMIT_SEQ);
+    NEXT_TRANSMIT_SEQ = (NEXT_TRANSMIT_SEQ + 1) % 4096;
+    req.do_pack_bytes();
+    req.store_in_replay_buffer(cfg.device_id);
+
+    // REPLAY_TIMER starts when a TLP is sent and is not already running
+    if (!replay_timer_running) begin
+      start_replay_timer();
+    end
+
+    // Spend the credits (new TLPs only, not replays)
+    fc_consume(fc_type, hdr_cost, data_cost);
+
+    `uvm_info(get_type_name(),
+              $sformatf("Device %0d Sent TLP: [Identifier=%h] | [length=%0d] | [address='h%h] | [seq_num=%0d] | [payload=%p] | [LCRC='h%h] | NEXT_TRANSMIT_SEQ='h%h",
+                        cfg.device_id, req.dllp_pkt[0], req.tlps_pkt.length, req.tlps_pkt.Address, req.seq_num, req.payload, req.lcrc, NEXT_TRANSMIT_SEQ), UVM_LOW);
+
+    phase.raise_objection(this);
+    // callback hook (e.g. corrupt LCRC to force a NAK); the replay buffer
+    // already holds the good copy, so a replay sends the correct TLP
+    `uvm_do_callbacks(dlcmsm_driver, pcie_dl_pkt_modify_callback, modify_item(req))
+    drive(req);
+    phase.drop_objection(this);
+    sent = 1;
+  endtask
+
+
+  //--------------------------------------------------------------------------
+  // Flow-control helpers
+  //   fc_type: 0 = Posted, 1 = Non-Posted, 2 = Completion
+  //   1 header credit per TLP, 1 data credit per 4 DW of payload.
+  //--------------------------------------------------------------------------
+  function void get_tlp_fc_cost(bit [31:0] hdr0, output int fc_type, output int hdr_cost, output int data_cost);
+    bit [2:0] fmt;
+    bit [4:0] typ;
+    int       len_dw;
+    fmt    = hdr0[31:29];
+    typ    = hdr0[28:24];
+    len_dw = (hdr0[9:0] == 0) ? 1024 : hdr0[9:0];
+    hdr_cost  = 1;
+    data_cost = fmt[1] ? (len_dw + 3) / 4 : 0;           // Fmt[1] = TLP carries data
+    if (typ == 5'b01010 || typ == 5'b01011)  fc_type = 2; // Cpl/CplD/CplLk/CplDLk
+    else if (typ[4:3] == 2'b10)              fc_type = 0; // Msg/MsgD   -> Posted
+    else if (typ == 5'b00000 && fmt[1])      fc_type = 0; // MWr        -> Posted
+    else                                     fc_type = 1; // MRd, MRdLk, IO, Cfg, AtomicOp -> Non-Posted
+  endfunction
+
+  function string fc_type_name(int fc_type);
+    case (fc_type)
+      0: return "Posted";
+      1: return "Non-Posted";
+      default: return "Completion";
+    endcase
+  endfunction
+
+  // Field widths for the modulo credit arithmetic (wider when Scaled FC is on)
+  function int fc_hdr_width();
+    return (local_data[0] && remote_data[0]) ? 12 : 8;
+  endfunction
+  function int fc_data_width();
+    return (local_data[0] && remote_data[0]) ? 16 : 12;
+  endfunction
+
+  // Spec gating rule: (CREDIT_LIMIT - (CREDITS_CONSUMED + cost)) mod 2^N <= 2^(N-1)
+  // Infinite credits (0 advertised in InitFC for that field) are never gated.
+  // A CREDIT_LIMIT of 0 reached through UpdateFC is a real limit.
+  function bit fc_credit_ok(bit infinite, int limit, int consumed, int cost, int width);
+    int modv;
+    int r;
+    if (cost == 0 || infinite) return 1;
+    modv = 1 << width;
+    r = (limit - (consumed + cost)) % modv;
+    if (r < 0) r += modv;
+    return (r <= modv/2);
+  endfunction
+
+  function bit fc_credits_available(int fc_type, int hdr_cost, int data_cost);
+    int hw, dw;
+    hw = fc_hdr_width();
+    dw = fc_data_width();
+    case (fc_type)
+      0:       return fc_credit_ok(tx_fc_hdr_inf[0], tx_ph_limit,   tx_ph_consumed,   hdr_cost, hw) && fc_credit_ok(tx_fc_data_inf[0], tx_pd_limit,   tx_pd_consumed,   data_cost, dw);
+      1:       return fc_credit_ok(tx_fc_hdr_inf[1], tx_nph_limit,  tx_nph_consumed,  hdr_cost, hw) && fc_credit_ok(tx_fc_data_inf[1], tx_npd_limit,  tx_npd_consumed,  data_cost, dw);
+      default: return fc_credit_ok(tx_fc_hdr_inf[2], tx_cplh_limit, tx_cplh_consumed, hdr_cost, hw) && fc_credit_ok(tx_fc_data_inf[2], tx_cpld_limit, tx_cpld_consumed, data_cost, dw);
+    endcase
+  endfunction
+
+  function void fc_consume(int fc_type, int hdr_cost, int data_cost);
+    int hm, dm;
+    hm = 1 << fc_hdr_width();
+    dm = 1 << fc_data_width();
+    case (fc_type)
+      0: begin
+        tx_ph_consumed  = (tx_ph_consumed  + hdr_cost)  % hm;
+        tx_pd_consumed  = (tx_pd_consumed  + data_cost) % dm;
+      end
+      1: begin
+        tx_nph_consumed = (tx_nph_consumed + hdr_cost)  % hm;
+        tx_npd_consumed = (tx_npd_consumed + data_cost) % dm;
+      end
+      default: begin
+        tx_cplh_consumed = (tx_cplh_consumed + hdr_cost)  % hm;
+        tx_cpld_consumed = (tx_cpld_consumed + data_cost) % dm;
+      end
+    endcase
+    `uvm_info("FC_SPEND", $sformatf("Device %0d Spent %s credits H:%0d D:%0d. Consumed now P:%0d/%0d NP:%0d/%0d CPL:%0d/%0d",
+                                    cfg.device_id, fc_type_name(fc_type), hdr_cost, data_cost,
+                                    tx_ph_consumed, tx_pd_consumed, tx_nph_consumed, tx_npd_consumed,
+                                    tx_cplh_consumed, tx_cpld_consumed), UVM_MEDIUM);
+  endfunction
+
+  // Receive rule: duplicate if (NEXT_RCV_SEQ - seq) mod 4096 <= 2048 (seq != NEXT_RCV_SEQ)
+  function bit seq_is_duplicate(bit [11:0] seq);
+    bit [11:0] d;
+    d = next_rcv_seq - seq;
+    return (d != 0 && d <= 12'd2048);
+  endfunction
+
+  //--------------------------------------------------------------------------
+  // Receive side of flow-control initialisation and credit updates
+  //--------------------------------------------------------------------------
+  // Credit type from the DLLP type: bits [5:4] = 00 P, 01 NP, 10 Cpl
+  function int fc_class(bit [7:0] t);
+    case (t[5:4])
+      2'b00:   return 0;
+      2'b01:   return 1;
+      default: return 2;
+    endcase
+  endfunction
+
+  function bit scaled_fc_active();
+    return (local_data[0] && remote_data[0]);
+  endfunction
+
+  // Scaled FC: HdrScale/DataScale 01 = x1, 10 = x4, 11 = x16 (00 = not used)
+  function int fc_scale_shift(bit [1:0] sc);
+    case (sc)
+      2'b10:   return 2;
+      2'b11:   return 4;
+      default: return 0;
+    endcase
+  endfunction
+
+  // Record the credit limit the partner advertised for credit type c.
+  //   is_init = 1 : InitFC1/InitFC2 (a value of 0 means infinite credits)
+  //   is_init = 0 : UpdateFC        (ignored for a field advertised as infinite)
+  function void set_tx_fc_limit(int c, bit [7:0] hdr, bit [11:0] data, bit [1:0] hs, bit [1:0] ds, bit is_init);
+    int h, d;
+    if (is_init) begin
+      tx_fc_hdr_inf[c]  = (hdr  == 0);
+      tx_fc_data_inf[c] = (data == 0);
+    end
+    h = hdr;
+    d = data;
+    if (scaled_fc_active()) begin
+      h = h << fc_scale_shift(hs);
+      d = d << fc_scale_shift(ds);
+    end
+    case (c)
+      0: begin
+        if (!tx_fc_hdr_inf[0])  tx_ph_limit   = h;
+        if (!tx_fc_data_inf[0]) tx_pd_limit   = d;
+      end
+      1: begin
+        if (!tx_fc_hdr_inf[1])  tx_nph_limit  = h;
+        if (!tx_fc_data_inf[1]) tx_npd_limit  = d;
+      end
+      default: begin
+        if (!tx_fc_hdr_inf[2])  tx_cplh_limit = h;
+        if (!tx_fc_data_inf[2]) tx_cpld_limit = d;
+      end
+    endcase
+    `uvm_info(get_type_name(), $sformatf("Device %0d %s %s credit limit: Hdr=%s Data=%s",
+                                         cfg.device_id, is_init ? "InitFC" : "UpdateFC", fc_type_name(c),
+                                         tx_fc_hdr_inf[c]  ? "infinite" : $sformatf("%0d", h),
+                                         tx_fc_data_inf[c] ? "infinite" : $sformatf("%0d", d)), UVM_LOW)
+  endfunction
+
+  // InitFC1 / InitFC2 received
+  //   FC_INIT1: record the credits from InitFC1 OR InitFC2 of each type, in
+  //             any order; FI1 (-> FC_INIT2) once P, NP and Cpl are recorded.
+  //   FC_INIT2: credit values are ignored; any InitFC2 sets FI2 (-> DL_ACTIVE).
+  //   Other states: ignored.
+  function void rx_initfc(pcie_dl_seq_item rx_item);
+    int c;
+    c = fc_class(rx_item.dllps_pkt.dllp_type);
+    case (fsm.curr_state)
+      FC_INIT1: begin
+        if (!fc_init_rcvd[c]) begin
+          set_tx_fc_limit(c, rx_item.dllps_pkt.HdrFC, rx_item.dllps_pkt.DataFC,
+                          rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.rsvd2, 1);
+          fc_init_rcvd[c] = 1;
+        end
+        if (fc_init_rcvd[0] && fc_init_rcvd[1] && fc_init_rcvd[2] && !fsm.go_fc2_state) begin
+          fsm.go_fc2_state = 1;
+          `uvm_info(get_type_name(), $sformatf("Device %0d: credits for P, NP and Cpl recorded (FI1), moving to FC_INIT2", cfg.device_id), UVM_LOW);
+        end
+      end
+      FC_INIT2: begin
+        if (rx_item.dllps_pkt.dllp_type inside {INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0} && !fsm.go_active) begin
+          fsm.go_active = 1;
+          `uvm_info(get_type_name(), $sformatf("Device %0d: InitFC2 received (FI2), moving to DL_ACTIVE", cfg.device_id), UVM_LOW);
+        end
+      end
+      default: begin
+        `uvm_info(get_type_name(), $sformatf("Device %0d: %s ignored in %s", cfg.device_id,
+                                             rx_item.dllps_pkt.dllp_type.name(), fsm.curr_state.name()), UVM_MEDIUM);
+      end
+    endcase
+  endfunction
+
+  // UpdateFC received: sets FI2 in FC_INIT2; updates the limit in FC_INIT2/DL_ACTIVE
+  function void rx_updatefc(pcie_dl_seq_item rx_item);
+    if (fsm.curr_state == FC_INIT2 && !fsm.go_active) begin
+      fsm.go_active = 1;
+      `uvm_info(get_type_name(), $sformatf("Device %0d: UpdateFC received (FI2), moving to DL_ACTIVE", cfg.device_id), UVM_LOW);
+    end
+    if (!(fsm.curr_state inside {FC_INIT2, DL_ACTIVE})) begin
+      `uvm_info(get_type_name(), $sformatf("Device %0d: %s ignored in %s", cfg.device_id,
+                                           rx_item.dllps_pkt.dllp_type.name(), fsm.curr_state.name()), UVM_MEDIUM);
+      return;
+    end
+    set_tx_fc_limit(fc_class(rx_item.dllps_pkt.dllp_type), rx_item.dllps_pkt.HdrFC, rx_item.dllps_pkt.DataFC,
+                    rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.rsvd2, 0);
+  endfunction
 
   // Drive the transaction DWORD-wise on interface
   task drive(pcie_dl_seq_item req);
@@ -919,6 +1269,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     end
 //     dl_sending_pl_port.put(req.dllp_pkt);
     dw_pkt::put_q(dl_sending_pl_port, req.dllp_pkt);
+    if (!req.is_tlp) rx_fc_note_tx_dllp(req);
       `uvm_info(get_full_name(),$sformatf("RC::%0b TLP_NO::%0d Dl_DONE:: %p\tIS_TLP::%0b  ::IDENTIFIER::%0h  from_TL::%0b", (cfg.device_id==0),cntr_tlp,req.dllp_pkt,req.is_tlp,req.dllp_pkt[0],req.from_TL),UVM_NONE);
 
   endtask
@@ -986,18 +1337,26 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
           received_lcrc = rx_lcrc;
 //           $display("989898988989898989898989989898989898");
 
+          // Nullified TLP (LCRC inverted): discard silently - NEXT_RCV_SEQ
+          // unchanged, no Ack/Nak
           if(computed_lcrc == ~received_lcrc)begin
             received_seq = sq_n;
-            `uvm_warning("LCRC",$sformatf("Device %0d: Nulified TLP seq_num %0d received LCRC inverted! Computed=%h Received=%h  - Dropping nulified TLP", cfg.device_id, received_seq, computed_lcrc, received_lcrc));
-            next_rcv_seq = (next_rcv_seq + 1) % 4096;
+            `uvm_warning("LCRC",$sformatf("Device %0d: Nulified TLP seq_num %0d received LCRC inverted! Computed=%h Received=%h  - Dropping nulified TLP (NEXT_RCV_SEQ stays %0d)", cfg.device_id, received_seq, computed_lcrc, received_lcrc, next_rcv_seq));
           end
 
+          // Bad LCRC: discard; Nak NEXT_RCV_SEQ - 1 unless a Nak is already
+          // scheduled (NAK_SCHEDULED is cleared by the next good TLP)
           else if (computed_lcrc != received_lcrc) begin
             `uvm_error("LCRC", $sformatf("Device %0d: LCRC mismatch! Computed=%h Received=%h - Dropping TLP", cfg.device_id, computed_lcrc, received_lcrc));
-            nak_scheduled = 1;
-            ack_timer_running = 0;
-            acknak_latency_timer.stop_timer();
-            schedule_nak(next_rcv_seq - 1);
+            if (!nak_scheduled) begin
+              nak_scheduled = 1;
+              ack_timer_running = 0;
+              acknak_latency_timer.stop_timer();
+              schedule_nak(next_rcv_seq - 12'd1);
+            end
+            else begin
+              `uvm_info("LCRC", $sformatf("Device %0d: NAK already scheduled - no new NAK", cfg.device_id), UVM_LOW);
+            end
           end
           else begin
             received_seq = sq_n;
@@ -1021,17 +1380,24 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
               `uvm_info(get_type_name(), $sformatf("Device %0d: Good TLP seq_num %0d received - timer continues running (will ACK up to %0d)", cfg.device_id, received_seq, received_seq), UVM_LOW);
 
             end 
-            else if (received_seq > next_rcv_seq) begin
-              `uvm_warning("SEQ_CHECK", $sformatf("Device %0d: Out-of-sequence: received=%0d expected=%0d - Scheduling Nak", cfg.device_id, received_seq, next_rcv_seq));
-              nak_scheduled = 1;
-              ack_timer_running = 0;
-              acknak_latency_timer.stop_timer();
-              schedule_nak(next_rcv_seq - 1);
-            end 
+            // Spec: if (NEXT_RCV_SEQ - Sequence Number) mod 4096 <= 2048 the TLP is a
+            // duplicate (discard, Ack NEXT_RCV_SEQ - 1); otherwise it is out of
+            // sequence (discard, Nak NEXT_RCV_SEQ - 1 unless a Nak is already scheduled).
+            else if (seq_is_duplicate(received_seq)) begin
+              `uvm_info("SEQ_CHECK", $sformatf("Device %0d: Duplicate TLP detected: received=%0d expected=%0d - Sending immediate ACK for seq %0d", cfg.device_id, received_seq, next_rcv_seq, next_rcv_seq - 12'd1), UVM_LOW);
+              schedule_ack(next_rcv_seq - 12'd1);
+            end
             else begin
-              `uvm_info("SEQ_CHECK", $sformatf("Device %0d: Duplicate TLP detected: received=%0d expected=%0d - Sending immediate ACK for last good seq %0d", cfg.device_id, received_seq, next_rcv_seq, last_good_seq_num_to_ack), UVM_LOW);
-              //schedule_ack(last_good_seq_num_to_ack);
-              schedule_ack(last_good_seq_num_to_ack);
+              `uvm_warning("SEQ_CHECK", $sformatf("Device %0d: Out-of-sequence: received=%0d expected=%0d - Scheduling Nak", cfg.device_id, received_seq, next_rcv_seq));
+              if (!nak_scheduled) begin
+                nak_scheduled = 1;
+                ack_timer_running = 0;
+                acknak_latency_timer.stop_timer();
+                schedule_nak(next_rcv_seq - 12'd1);
+              end
+              else begin
+                `uvm_info("SEQ_CHECK", $sformatf("Device %0d: NAK already scheduled - no new NAK", cfg.device_id), UVM_LOW);
+              end
             end
           end
           rx_tlp_item.received_lcrc = received_lcrc;
@@ -1181,8 +1547,12 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                         $sformatf("Device %0d RX ACK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
                                   cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
 
+              if (!acknak_seq_valid(rx_item.acknak_pkt.seq_num)) begin
+                `uvm_error("DL_PROTOCOL", $sformatf("Device %0d: Ack for seq_num %0d which was never sent (ACKD_SEQ=%0d NEXT_TRANSMIT_SEQ=%0d) - discarded",
+                                                    cfg.device_id, rx_item.acknak_pkt.seq_num, ACKD_SEQ, NEXT_TRANSMIT_SEQ));
+              end
               // Check for forward progress
-              if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
+              else if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
                 `uvm_info("ACK_PROGRESS", $sformatf("Device %0d: Forward progress detected! ACK seq='h%h > last_ack='h%h", 
                                                     cfg.device_id, rx_item.acknak_pkt.seq_num, ACKD_SEQ), UVM_LOW);
 
@@ -1212,274 +1582,43 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                         $sformatf("Device %0d RX NAK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
                                   cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
 
-              //Check for forward progress first
-              if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
-                ACKD_SEQ = rx_item.acknak_pkt.seq_num;
-                last_ackd_seq = ACKD_SEQ;
-                REPLAY_NUM = 2'b00;
-                stop_replay_timer();
-                rx_item.clear_replay_buffer_up_to_ack(cfg.device_id, ACKD_SEQ);
+              if (!acknak_seq_valid(rx_item.acknak_pkt.seq_num)) begin
+                `uvm_error("DL_PROTOCOL", $sformatf("Device %0d: Nak for seq_num %0d which was never sent (ACKD_SEQ=%0d NEXT_TRANSMIT_SEQ=%0d) - discarded",
+                                                    cfg.device_id, rx_item.acknak_pkt.seq_num, ACKD_SEQ, NEXT_TRANSMIT_SEQ));
               end
-
-              // Initiate replay regardless of forward progress
-              REPLAY_NUM = REPLAY_NUM + 1;
-              handle_nak_replay(rx_item.acknak_pkt.seq_num);
+              else begin
+                // A Nak also acknowledges every TLP up to AckNak_Seq_Num
+                if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
+                  ACKD_SEQ = rx_item.acknak_pkt.seq_num;
+                  last_ackd_seq = ACKD_SEQ;
+                  REPLAY_NUM = 2'b00;
+                  stop_replay_timer();
+                  rx_item.clear_replay_buffer_up_to_ack(cfg.device_id, ACKD_SEQ);
+                end
+                // then all TLPs that are still unacknowledged are replayed
+                // (REPLAY_NUM is incremented in start_replay)
+                handle_nak_replay(rx_item.acknak_pkt.seq_num);
+              end
             end
 
             // DLLP types
-            INITFC1_P_VC0: begin
-              dllp_P_rcvd = 1;
-              `uvm_info(get_type_name(), 
+            INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
+            INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0: begin
+              `uvm_info(get_type_name(),
                         $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
                                   cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
                                   rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
                                   rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              tx_ph_limit = rx_item.dllps_pkt.HdrFC;   // Capture Header Limit
-              tx_pd_limit = rx_item.dllps_pkt.DataFC;  // Capture Data Limit
-
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_ph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_pd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-
-              end
-
-              // Keep your existing state logic for INITFC1/2 completion
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_P_VC0) dllp_P_rcvd = 1;
-
-              // Keep your existing uvm_info
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated POSTED Credits: PH_Limit=%0d PD_Limit=%0d", 
-                                                   cfg.device_id, tx_ph_limit, tx_pd_limit), UVM_NONE);
-            end
-
-            INITFC1_NP_VC0: begin
-              if (dllp_P_rcvd) dllp_NP_rcvd = 1;
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              tx_nph_limit = rx_item.dllps_pkt.HdrFC;
-              tx_npd_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_nph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_npd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_NP_VC0 && dllp_P_rcvd) dllp_NP_rcvd = 1;
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated NON-POSTED Credits: NPH_Limit=%0d NPD_Limit=%0d", 
-                                                   cfg.device_id, tx_nph_limit, tx_npd_limit), UVM_NONE);
-            end
-
-            INITFC1_CPL_VC0: begin
-              if (dllp_P_rcvd && dllp_NP_rcvd) begin
-                dllp_CPL_rcvd = 1;
-                fsm.go_fc2_state = 1;
-                `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed, moving to FC_INIT2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_NONE);
-              tx_cplh_limit = rx_item.dllps_pkt.HdrFC;
-              tx_cpld_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_cplh_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_cpld_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              // Existing FSM transition logic
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_CPL_VC0 && dllp_P_rcvd && dllp_NP_rcvd) begin
-                dllp_CPL_rcvd = 1;
-                fsm.go_fc2_state = 1;
-                `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed", cfg.device_id), UVM_LOW);
-              end
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated CPL Credits: CPLH_Limit=%0d CPLD_Limit=%0d", 
-                                                   cfg.device_id, tx_cplh_limit, tx_cpld_limit), UVM_NONE);
-            end
-
-            INITFC2_P_VC0: begin
-              if (fsm.curr_state == FC_INIT2 && fsm.go_fc2_state && !fsm.go_active) begin
-                fsm.go_active = 1;
-                repeat(2) @(posedge vif.clk);
-                `uvm_info(get_type_name(), $sformatf("Device %0d: FSM: Transitioning to DL_ACTIVE after INITFC2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              tx_ph_limit = rx_item.dllps_pkt.HdrFC;   // Capture Header Limit
-              tx_pd_limit = rx_item.dllps_pkt.DataFC;  // Capture Data Limit
-
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_ph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_pd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              // Keep your existing state logic for INITFC1/2 completion
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_P_VC0) dllp_P_rcvd = 1;
-
-              // Keep your existing uvm_info
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated POSTED Credits: PH_Limit=%0d PD_Limit=%0d", 
-                                                   cfg.device_id, tx_ph_limit, tx_pd_limit), UVM_NONE);
-            end
-
-            INITFC2_NP_VC0: begin
-              if (fsm.curr_state == FC_INIT2 && fsm.go_fc2_state && !fsm.go_active) begin
-                fsm.go_active = 1;
-                repeat(2) @(posedge vif.clk);
-                `uvm_info(get_type_name(), $sformatf("Device %0d: FSM: Transitioning to DL_ACTIVE after INITFC2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_NONE);
-              tx_nph_limit = rx_item.dllps_pkt.HdrFC;
-              tx_npd_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_nph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_npd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_NP_VC0 && dllp_P_rcvd) dllp_NP_rcvd = 1;
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated NON-POSTED Credits: NPH_Limit=%0d NPD_Limit=%0d", 
-                                                   cfg.device_id, tx_nph_limit, tx_npd_limit), UVM_HIGH);
-            end
-
-            INITFC2_CPL_VC0: begin
-              if (fsm.curr_state == FC_INIT2 && fsm.go_fc2_state && !fsm.go_active) begin
-                fsm.go_active = 1;
-                repeat(2) @(posedge vif.clk);
-                `uvm_info(get_type_name(), $sformatf("Device %0d: FSM: Transitioning to DL_ACTIVE after INITFC2", cfg.device_id), UVM_LOW);
-              end
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
-                                  cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
-                                  rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
-                                  rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_NONE);
-              tx_cplh_limit = rx_item.dllps_pkt.HdrFC;
-              tx_cpld_limit = rx_item.dllps_pkt.DataFC;
-
-              if(local_data[0]&&remote_data[0])begin
-                rx_item.scale_h();
-                rx_item.scale_d();
-                tx_cplh_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                tx_cpld_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-              end
-
-              // Existing FSM transition logic
-              if (rx_item.dllps_pkt.dllp_type == INITFC1_CPL_VC0 && dllp_P_rcvd && dllp_NP_rcvd) begin
-                dllp_CPL_rcvd = 1;
-                fsm.go_fc2_state = 1;
-                `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed", cfg.device_id), UVM_LOW);
-              end
-
-              `uvm_info(get_type_name(), $sformatf("Device %0d Updated CPL Credits: CPLH_Limit=%0d CPLD_Limit=%0d", 
-                                                   cfg.device_id, tx_cplh_limit, tx_cpld_limit), UVM_NONE);
-            end
-
-            //ACK/NAK DLLP processing with device-specific replay buffer handling
-            ACK_DLLP_TYPE: begin
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX ACK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
-                                  cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
-
-
-            end
-
-            NAK_DLLP_TYPE: begin
-              `uvm_info(get_type_name(), 
-                        $sformatf("Device %0d RX NAK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
-                                  cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
-
-              //Handle NAK - might need to replay from the NAK'd sequence number
-              handle_nak_replay(rx_item.acknak_pkt.seq_num);
+              rx_initfc(rx_item);
             end
 
             UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0: begin
-              if(fsm.curr_state == FC_INIT2)
-                fsm.go_active = 1;
-              `uvm_info(get_type_name(), 
+              `uvm_info(get_type_name(),
                         $sformatf("Device %0d RX DLLP: [dllp_type: %0h %s] | [rsvd1:'h%0h] | [HdrFC:'h%0h] | [rsvd2:'h%0h] | [DataFC:'h%0h] | CRC_Valid:%0b",
                                   cfg.device_id, rx_item.dllps_pkt.dllp_type, rx_item.dllps_pkt.dllp_type.name(),
                                   rx_item.dllps_pkt.rsvd1, rx_item.dllps_pkt.HdrFC,
                                   rx_item.dllps_pkt.rsvd2, rx_item.dllps_pkt.DataFC, crc_valid), UVM_LOW);
-              if(rx_item.dllps_pkt.dllp_type==UPDATEFC_P_VC0)begin
-                tx_ph_limit = rx_item.dllps_pkt.HdrFC;   // Capture Header Limit
-                tx_pd_limit = rx_item.dllps_pkt.DataFC;  // Capture Data Limit
-
-                if(local_data[0]&&remote_data[0])begin
-                  rx_item.scale_h();
-                  rx_item.scale_d();
-                  tx_ph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                  tx_pd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-                end
-
-                // Keep your existing state logic for INITFC1/2 completion
-                if (rx_item.dllps_pkt.dllp_type == INITFC1_P_VC0) dllp_P_rcvd = 1;
-
-                // Keep your existing uvm_info
-                `uvm_info(get_type_name(), $sformatf("Device %0d Updated POSTED Credits: PH_Limit=%0d PD_Limit=%0d", 
-                                                     cfg.device_id, tx_ph_limit, tx_pd_limit), UVM_HIGH);
-              end
-              if(rx_item.dllps_pkt.dllp_type==UPDATEFC_NP_VC0)begin
-                tx_nph_limit = rx_item.dllps_pkt.HdrFC;
-                tx_npd_limit = rx_item.dllps_pkt.DataFC;
-
-                if(local_data[0]&&remote_data[0])begin
-                  rx_item.scale_h();
-                  rx_item.scale_d();
-                  tx_nph_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                  tx_npd_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-                end
-
-                if (rx_item.dllps_pkt.dllp_type == INITFC1_NP_VC0 && dllp_P_rcvd) dllp_NP_rcvd = 1;
-
-                `uvm_info(get_type_name(), $sformatf("Device %0d Updated NON-POSTED Credits: NPH_Limit=%0d NPD_Limit=%0d", 
-                                                     cfg.device_id, tx_nph_limit, tx_npd_limit), UVM_HIGH);
-              end
-              if(rx_item.dllps_pkt.dllp_type==UPDATEFC_CPL_VC0)begin
-                tx_cplh_limit = rx_item.dllps_pkt.HdrFC;
-                tx_cpld_limit = rx_item.dllps_pkt.DataFC;
-
-                if(local_data[0]&&remote_data[0])begin
-                  rx_item.scale_h();
-                  rx_item.scale_d();
-                  tx_cplh_limit = rx_item.dllps_pkt.HdrFC<<rx_item.sclh;
-                  tx_cpld_limit = rx_item.dllps_pkt.DataFC<<rx_item.scld;
-                end
-
-                // Existing FSM transition logic
-                if (rx_item.dllps_pkt.dllp_type == INITFC1_CPL_VC0 && dllp_P_rcvd && dllp_NP_rcvd) begin
-                  dllp_CPL_rcvd = 1;
-                  fsm.go_fc2_state = 1;
-                  `uvm_info(get_type_name(), $sformatf("Device %0d: INITFC1 sequence completed", cfg.device_id), UVM_LOW);
-                end
-
-                `uvm_info(get_type_name(), $sformatf("Device %0d Updated CPL Credits: CPLH_Limit=%0d CPLD_Limit=%0d", 
-                                                     cfg.device_id, tx_cplh_limit, tx_cpld_limit), UVM_HIGH);
-              end
-
+              rx_updatefc(rx_item);
             end
             //////////////////////////////Power Management AND NOP DLLP Handling////////////////////////////
             NOP:begin 
@@ -1534,9 +1673,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
 
   //NAK replay handling
   task handle_nak_replay(bit [11:0] nak_seq_num);
-    replay_mode = 1;  // Ensure replay mode is active
-    initiate_buffer_replay(nak_seq_num+1);
-    start_replay_timer();
+    start_replay($sformatf("Nak (AckNak_Seq_Num %0d)", nak_seq_num));
   endtask
 
 
@@ -1616,6 +1753,9 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     int header_start, header_end, payload_start, payload_end;
     int tlp_pkt_size;
     int clean_pkt_bytes;
+    int hdr_dws;
+
+    rx_fc_on_tlp_received(tlp_item.tlp_pkt[1]);
 
     clean_tlp = pcie_dl_seq_item::type_id::create("clean_tlp", this);
     clean_tlp.device_id = cfg.device_id;
@@ -1633,9 +1773,11 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     tlp_pkt_size = tlp_item.tlp_pkt.size();
     clean_packet.delete();
 
-    header_start = 0;
-    header_end = 2;                // first 3 DWORDs = header
-    payload_start = 4;             // payload starts after seq_num dword at index 3
+    // tlp_pkt = {seq DW, header (3 or 4 DW), payload..., LCRC}
+    hdr_dws = tlp_item.tlp_pkt[1][29] ? 4 : 3;   // Fmt[0]
+    header_start = 1;
+    header_end = hdr_dws;
+    payload_start = hdr_dws + 1;
     payload_end = tlp_pkt_size - 2; // exclude last DWORD which is LCRC
 
     // Copy header DWORDs
@@ -1695,6 +1837,243 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     end
 
     `uvm_info("TL_QUEUE_CONTENTS", $sformatf("Device %0d: === End of TL Queue ===", cfg.device_id), UVM_LOW);
+  endtask
+
+
+  //==========================================================================
+  // Receiver flow control
+  //   CREDITS_ALLOCATED = what this device advertised (taken from the InitFC /
+  //   UpdateFC DLLPs it transmits), CREDITS_RECEIVED = credits of the good
+  //   TLPs it accepted. Receiver overflow is checked for every TLP.
+  //   With cfg.rx_fc_auto_update = 1 the TL is treated as consuming every TLP
+  //   at once: its credits are freed and returned with an UpdateFC.
+  //==========================================================================
+  function int rx_fc_class(bit [7:0] t);   // DLLP type bits [5:4]: 00 P, 01 NP, 10 Cpl
+    case (t[5:4])
+      2'b00:   return 0;
+      2'b01:   return 1;
+      default: return 2;
+    endcase
+  endfunction
+
+  // Called for every DLLP this device transmits
+  function void rx_fc_note_tx_dllp(pcie_dl_seq_item req);
+    bit [7:0] t;
+    int c;
+    if (req.is_tlp || req.is_nop || req.is_pm) return;
+    t = req.dllps_pkt.dllp_type;
+    if (!(t inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
+                    INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0,
+                    UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0})) return;
+    c = rx_fc_class(t);
+    if (t[6]) begin   // InitFC1 (01xx_xxxx) / InitFC2 (11xx_xxxx)
+      if (!rx_fc_init_seen[c]) begin
+        rx_fc_init_seen[c]  = 1;
+        rx_fc_hdr_inf[c]    = (req.dllps_pkt.HdrFC  == 0);
+        rx_fc_data_inf[c]   = (req.dllps_pkt.DataFC == 0);
+        rx_fc_hdr_alloc[c]  = req.dllps_pkt.HdrFC;
+        rx_fc_data_alloc[c] = req.dllps_pkt.DataFC;
+        rx_fc_hdr_rcvd[c]   = 0;
+        rx_fc_data_rcvd[c]  = 0;
+        rx_fc_scaled[c]     = (req.dllps_pkt.rsvd1 > 1 || req.dllps_pkt.rsvd2 > 1);
+      end
+    end
+    else if (!cfg.rx_fc_auto_update) begin
+      // UpdateFC from the DL sequence. With auto update the driver itself
+      // owns CREDITS_ALLOCATED and sequence values are not taken over.
+      if (!rx_fc_hdr_inf[c])  rx_fc_hdr_alloc[c]  = req.dllps_pkt.HdrFC;
+      if (!rx_fc_data_inf[c]) rx_fc_data_alloc[c] = req.dllps_pkt.DataFC;
+    end
+  endfunction
+
+  // Called for every good TLP accepted (hdr0 = first header DW)
+  function void rx_fc_on_tlp_received(bit [31:0] hdr0);
+    int c, h, d;
+    get_tlp_fc_cost(hdr0, c, h, d);
+    if (!rx_fc_init_seen[c]) return;
+    rx_fc_hdr_rcvd[c]  = (rx_fc_hdr_rcvd[c]  + h) % 256;
+    rx_fc_data_rcvd[c] = (rx_fc_data_rcvd[c] + d) % 4096;
+    // Receiver overflow: (CREDITS_ALLOCATED - CREDITS_RECEIVED) mod 2^N >= 2^(N-1)
+    if (!rx_fc_scaled[c]) begin
+      if (!rx_fc_hdr_inf[c] && (((rx_fc_hdr_alloc[c] - rx_fc_hdr_rcvd[c]) & 8'hFF) >= 128))
+        `uvm_error("FC_OVERFLOW", $sformatf("Device %0d: Receiver overflow - %s header credits: allocated %0d, received %0d",
+                                            cfg.device_id, fc_type_name(c), rx_fc_hdr_alloc[c], rx_fc_hdr_rcvd[c]))
+      if (!rx_fc_data_inf[c] && (((rx_fc_data_alloc[c] - rx_fc_data_rcvd[c]) & 12'hFFF) >= 2048))
+        `uvm_error("FC_OVERFLOW", $sformatf("Device %0d: Receiver overflow - %s data credits: allocated %0d, received %0d",
+                                            cfg.device_id, fc_type_name(c), rx_fc_data_alloc[c], rx_fc_data_rcvd[c]))
+    end
+    if (cfg.rx_fc_auto_update) begin
+      if (!rx_fc_hdr_inf[c])  rx_fc_hdr_alloc[c]  = (rx_fc_hdr_alloc[c]  + h) % 256;
+      if (!rx_fc_data_inf[c]) rx_fc_data_alloc[c] = (rx_fc_data_alloc[c] + d) % 4096;
+      if (!(rx_fc_hdr_inf[c] && rx_fc_data_inf[c])) rx_fc_dirty[c] = 1;
+    end
+  endfunction
+
+  // Sends an UpdateFC for every credit type whose credits were freed, and
+  // repeats the UpdateFC of every type periodically (spec: UpdateFC is also
+  // sent at regular intervals; this also restores a limit that a DL
+  // sequence's UpdateFC may have lowered).
+  task rx_fc_updater();
+    int cnt, idle;
+    cnt  = 0;
+    idle = 0;
+    forever begin
+      @(posedge vif.clk);
+      if (!cfg.rx_fc_auto_update || fsm.curr_state != DL_ACTIVE) begin
+        cnt  = 0;
+        idle = 0;
+        continue;
+      end
+      idle++;
+      if (rx_fc_dirty[0] || rx_fc_dirty[1] || rx_fc_dirty[2]) cnt++;
+      if (cnt >= cfg.rx_fc_update_cycles) begin
+        cnt  = 0;
+        idle = 0;
+        for (int c = 0; c < 3; c++) begin
+          if (rx_fc_dirty[c]) begin
+            rx_fc_dirty[c] = 0;
+            send_updatefc(c);
+          end
+        end
+      end
+      else if (idle >= cfg.rx_fc_refresh_cycles) begin
+        idle = 0;
+        for (int c = 0; c < 3; c++)
+          if (rx_fc_init_seen[c] && !(rx_fc_hdr_inf[c] && rx_fc_data_inf[c])) send_updatefc(c);
+      end
+    end
+  endtask
+
+  task send_updatefc(int c);
+    pcie_dl_seq_item req;
+    req = pcie_dl_seq_item::type_id::create("updatefc");
+    req.device_id = cfg.device_id;
+    req.is_tlp = 0;
+    req.is_nop = 0;
+    req.is_pm  = 0;
+    req.acknak_pkt.dllp_type = ACK_DLLP_TYPE;   // 0: not an Ack/Nak
+    case (c)
+      0:       req.dllps_pkt.dllp_type = UPDATEFC_P_VC0;
+      1:       req.dllps_pkt.dllp_type = UPDATEFC_NP_VC0;
+      default: req.dllps_pkt.dllp_type = UPDATEFC_CPL_VC0;
+    endcase
+    req.dllps_pkt.rsvd1  = 0;
+    req.dllps_pkt.rsvd2  = 0;
+    req.dllps_pkt.HdrFC  = rx_fc_hdr_inf[c]  ? 0 : rx_fc_hdr_alloc[c];
+    req.dllps_pkt.DataFC = rx_fc_data_inf[c] ? 0 : rx_fc_data_alloc[c];
+    `uvm_info(get_type_name(), $sformatf("Device %0d: returning %s credits - UpdateFC HdrFC=%0d DataFC=%0d",
+                                         cfg.device_id, fc_type_name(c), req.dllps_pkt.HdrFC, req.dllps_pkt.DataFC), UVM_LOW)
+    send_dllp(req);
+  endtask
+
+
+  //==========================================================================
+  // DL_Down
+  //   LinkUp = 0 (LTSSM in Detect/Polling/Disabled/Hot Reset), reset, or the
+  //   dl_force_down test hook: the DLCMSM goes to DL_INACTIVE, the replay
+  //   buffer, pending TLPs and all sequence-number / Ack-Nak / flow-control
+  //   state are discarded. When LinkUp returns, the DLCMSM initialises again
+  //   (DL_INACTIVE -> DL_FEATURE -> DL_INIT -> FC_INIT1 -> FC_INIT2 -> DL_ACTIVE).
+  //   InitFC/UpdateFC for the new initialisation come from a DL sequence
+  //   started by the test/env.
+  //==========================================================================
+  function bit dl_link_is_up();
+    ltssm_state_e s;
+    if (dl_force_down || vif.rst === 1'b1) return 0;
+    s = (cfg.device_id == 0) ? ltssm_rc_state : ltssm_ep_state;
+    return !(s inside {DETECT_QUIET, DETECT_ACTIVE, POLLING_ACTIVE, POLLING_CONFIG,
+                       DISABLED, DISABLE, HOTRESET});
+  endfunction
+
+  task dlcmsm_rx_restartable();
+    forever begin
+      fork
+        begin
+          rx_proc = process::self();
+          dlcmsm_rx();
+        end
+      join
+      // dlcmsm_rx was killed by a DL_Down: start it again for the next
+      // flow-control initialisation
+      wait (fsm.curr_state == FC_INIT1);
+    end
+  endtask
+
+  task dl_link_monitor();
+    forever begin
+      @(posedge vif.clk);
+      if (dl_down_done || dl_link_is_up()) continue;
+      dl_down();
+      // wait for LinkUp, then the DLCMSM starts again from DL_INACTIVE
+      do @(posedge vif.clk); while (!dl_link_is_up());
+      `uvm_info("DL_DOWN", $sformatf("Device %0d: LinkUp again - DLCMSM initialises again", cfg.device_id), UVM_NONE)
+      dl_down_done = 0;
+      fsm.link_up  = 1;
+      if (cfg.dl_feature_exchange_enable) begin
+        wait (fsm.curr_state == DL_FEATURE);
+        fork
+          begin pr[0] = process::self(); dlcmsm_tx_dlf(); end
+          begin pr[1] = process::self(); dlcmsm_rx_dlf(); end
+        join_none
+      end
+    end
+  endtask
+
+  task dl_down();
+    int n_tlps;
+    dl_down_count++;
+    dl_down_done = 1;
+    `uvm_info("DL_DOWN", $sformatf("Device %0d: DL_Down (LinkUp = 0) in %s - discarding Data Link Layer state",
+                                   cfg.device_id, fsm.curr_state.name()), UVM_NONE)
+    // stop the receive path and a feature exchange still in progress
+    if (rx_proc != null && rx_proc.status() != process::FINISHED && rx_proc.status() != process::KILLED) rx_proc.kill();
+    for (int i = 0; i < 2; i++)
+      if (pr[i] != null && pr[i].status() != process::FINISHED && pr[i].status() != process::KILLED) pr[i].kill();
+
+    // DLCMSM -> DL_INACTIVE; it waits there for LinkUp
+    fsm.link_up = 0;
+    fsm.dl_down();
+    cfg.curr_state = fsm.curr_state;
+    cfg.last_state = fsm.last_state;
+
+    // transmit side: replay buffer, TLPs not yet sent, sequence numbers
+    n_tlps = dl_tlp_queue.size();
+    dl_tlp_queue.delete();
+    pcie_dl_seq_item::clear_replay_buffer_static(cfg.device_id);
+    replay_queue.delete();
+    replay_mode       = 0;
+    NEXT_TRANSMIT_SEQ = 12'h000;
+    ACKD_SEQ          = 12'hFFF;
+    last_ackd_seq     = 12'hFFF;
+    REPLAY_NUM        = 2'b00;
+    stop_replay_timer();
+
+    // receive side: sequence numbers, Ack/Nak
+    acknak_latency_timer.stop_timer();
+    ack_timer_running        = 0;
+    nak_scheduled            = 0;
+    acknak_req_fifo.flush();
+    next_rcv_seq             = 12'h000;
+    last_good_seq_num_to_ack = 12'h000;
+    tl_queue.delete();
+
+    // flow control, both directions
+    tx_ph_limit  = 0; tx_pd_limit  = 0; tx_ph_consumed  = 0; tx_pd_consumed  = 0;
+    tx_nph_limit = 0; tx_npd_limit = 0; tx_nph_consumed = 0; tx_npd_consumed = 0;
+    tx_cplh_limit = 0; tx_cpld_limit = 0; tx_cplh_consumed = 0; tx_cpld_consumed = 0;
+    for (int c = 0; c < 3; c++) begin
+      rx_fc_init_seen[c] = 0;
+      rx_fc_dirty[c]     = 0;
+      rx_fc_hdr_rcvd[c]  = 0;
+      rx_fc_data_rcvd[c] = 0;
+    end
+
+    // Data Link Feature exchange is done again
+    f_rcd = 0;
+    cfg.dl_feature_sprt_valid  = 0;
+    cfg.remote_feature_support = 0;
+
+    `uvm_info("DL_DOWN", $sformatf("Device %0d: %0d TLP(s) not yet sent were discarded", cfg.device_id, n_tlps), UVM_LOW)
   endtask
 
 endclass

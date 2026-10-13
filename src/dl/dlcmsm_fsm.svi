@@ -8,16 +8,18 @@ else\
 class dlcmsm_fsm extends uvm_object;
   `uvm_object_utils(dlcmsm_fsm)
   
-  static dlcmsm_state_e curr_state, last_state;
+  // Per-device state (these were 'static', so RC and EP shared ONE DLCMSM)
+  dlcmsm_state_e curr_state, last_state;
   int ts1_recvd, ts2_recvd;
   int ts1_xmitd, ts2_xmitd;
-  static bit go_fc2_state, go_active, go_init;
+  bit go_fc2_state, go_active, go_init;
   bit timer_started, feature_dllp_received;
   pcie_dl_cfg cfg_local;
 
   timer_uvm_dl state_timer;
   
   virtual dl_if vif;
+  bit link_up = 1;   // LinkUp from the Physical Layer: DL_INACTIVE is left only while it is 1
   
   function new(string name ="dlcmsm_fsm");
     super.new(name);
@@ -37,12 +39,15 @@ class dlcmsm_fsm extends uvm_object;
     ts1_xmitd = 0;
     ts2_xmitd = 0;
     go_fc2_state=0;
+    go_active=0;
+    go_init=0;
   endfunction
 
   task update_state();
     //`uvm_info("DLCMSM FSM",$sformatf("state:%0p FSM",curr_state), UVM_NONE)
     case (curr_state)
       DL_INACTIVE: begin 
+        wait (link_up);
         if (!timer_started) begin
           state_timer.start_timer(LTSSM_12MS, cfg_local.name);        
           timer_started = 1;
@@ -115,4 +120,15 @@ class dlcmsm_fsm extends uvm_object;
       
     endcase
   endtask
+
+  // DL_Down (LinkUp = 0 or reset): back to DL_INACTIVE. Called by the driver.
+  function void dl_down();
+    last_state    = curr_state;
+    curr_state    = DL_INACTIVE;
+    go_init       = 0;
+    go_fc2_state  = 0;
+    go_active     = 0;
+    timer_started = 0;
+    `DLCMSM_GLOBAL_STATE
+  endfunction
 endclass
