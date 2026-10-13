@@ -115,7 +115,7 @@ class mem_wr_rd_seq extends siv_pcie_tl_seq;
   task body();begin
     if(device_cfg.is_rc)begin
 //       `uvm_warning(get_type_name(),"///////////////////INSIDE TL SEQUENCE/////////////////////////////");
-      repeat(1) begin
+      repeat(4) begin
         `uvm_do_with(req, {req.pkt_type == 2;             //memory write
                            req.header_mem.typef == 0;
                            req.header_mem.fmt == 2;
@@ -127,7 +127,7 @@ class mem_wr_rd_seq extends siv_pcie_tl_seq;
 
       end
 //       `uvm_warning(get_type_name(),"///////////////////AFTER UVM DO/////////////////////////////");
-      repeat(1) begin
+      repeat(4) begin
         `uvm_do_with(req, {req.pkt_type == 2;             //memory read
                            req.header_mem.typef == 0;
                            req.header_mem.fmt == 0;
@@ -802,6 +802,61 @@ class seq_config_wr_rd_4dw_header extends siv_pcie_tl_seq;
 endclass
 
 
+// AtomicOp FetchAdd
+class seq_fetchadd_atomicop_seq extends siv_pcie_tl_seq;
+  `uvm_object_utils(seq_fetchadd_atomicop_seq)
+  function new(string name="seq_fetchadd_atomicop");
+    super.new(name);
+  endfunction
+  task body();
+
+    if(device_cfg.is_rc) begin
+        `uvm_do_with(req,{req.pkt_type == 2;             //memory write
+                          req.header_mem.typef == 0;
+                          req.header_mem.fmt == 2;
+                          req.header_mem.td == 0;
+//                           req.header_mem.requester_id==34;
+                          req.header_mem.first_dw== 4'b1111;
+                          req.header_mem.last_dw== 4'b1111;
+                          req.header_mem.address1 == 32'h0000_3000;
+                          req.header_mem.len ==3;
+//                           req.payload_m[0] == 32'h0011_2233;// a dummy write at address
+                          req.payload_m.size() == req.header_mem.len;});
+
+`uvm_info("SENT","seq1",UVM_NONE)
+
+
+
+        `uvm_do_with(req,{req.pkt_type == 2;             //Atomic FetchAdd 
+                          req.header_mem.typef == 5'b01100;
+                          req.header_mem.fmt == 2;
+                          req.header_mem.td == 0;
+//                           req.header_mem.requester_id==34;
+                          req.header_mem.first_dw==15;
+                          req.header_mem.last_dw==15;
+                          req.header_mem.address1 == 32'h0000_3000;
+                          req.header_mem.len ==2;
+                          req.payload_m.size() == req.header_mem.len;});
+`uvm_info("SENT","seq2",UVM_NONE)
+ 
+        `uvm_do_with(req,{req.pkt_type == 2;             //Atomic FetchAdd 2DW
+                          req.header_mem.typef == 5'b01100;
+                          req.header_mem.fmt == 2;
+                          req.header_mem.td == 0;
+//                           req.header_mem.requester_id==34;
+                          req.header_mem.first_dw==15;
+                          req.header_mem.last_dw==15;
+                          req.header_mem.address1 == 32'h0000_3000;
+                          req.header_mem.len == 1;
+                          req.payload_m.size() == req.header_mem.len;});
+    
+
+`uvm_info("SENT","seq3",UVM_NONE)
+
+end
+  endtask
+endclass
+
 //Trying unconditional swap
 class seq_unconditional_swap_atomicop extends siv_pcie_tl_seq;
   `uvm_object_utils(seq_unconditional_swap_atomicop)
@@ -823,20 +878,9 @@ class seq_unconditional_swap_atomicop extends siv_pcie_tl_seq;
 //                           req.payload_m[0] == 32'h0011_2233;// a dummy write at address
                           req.payload_m.size() == req.header_mem.len;});
       end
-//       repeat(1)begin
-//         `uvm_do_with(req,{req.pkt_type == 2;             //memory read to check 
-//                           req.header_mem.typef == 0;
-//                           req.header_mem.fmt == 0;
-//                           req.header_mem.td == 0;
-// //                           req.header_mem.requester_id==34;
-//                           req.header_mem.first_dw==15;
-//                           req.header_mem.last_dw==15;
-//                           req.header_mem.address1 == 32'h0000_3000;
-//                           req.header_mem.len ==1;
-//                           req.payload_m.size() == req.header_mem.len;});
-//       end
-      repeat(1)begin
-        `uvm_do_with(req,{req.pkt_type == 2;             //memory read to check 
+      
+repeat(1)begin
+        `uvm_do_with(req,{req.pkt_type == 2;             //Atomic swap 
                           req.header_mem.typef == 5'b01101;
                           req.header_mem.fmt == 2;
                           req.header_mem.td == 0;
@@ -844,10 +888,23 @@ class seq_unconditional_swap_atomicop extends siv_pcie_tl_seq;
                           req.header_mem.first_dw==15;
                           req.header_mem.last_dw==15;
                           req.header_mem.address1 == 32'h0000_3000;
-                          req.header_mem.len ==3;
+                          req.header_mem.len ==1;
 //                           req.payload_m[0]==32'h0022_3344;
                           req.payload_m.size() == req.header_mem.len;});
-      end
+ 
+
+        `uvm_do_with(req,{req.pkt_type == 2;             //Atomic swap 2DW
+                          req.header_mem.typef == 5'b01101;
+                          req.header_mem.fmt == 2;
+                          req.header_mem.td == 0;
+//                           req.header_mem.requester_id==34;
+                          req.header_mem.first_dw==15;
+                          req.header_mem.last_dw==15;
+                          req.header_mem.address1 == 32'h0000_3000;
+                          req.header_mem.len ==2;
+//                           req.payload_m[0]==32'h0022_3344;
+                          req.payload_m.size() == req.header_mem.len;});
+     end
     end
   endtask
 endclass
@@ -912,6 +969,7 @@ class seq_compare_and_swap extends siv_pcie_tl_seq;
     super.new(name);
   endfunction
   task body();
+  bit[31:0] que[$];
     if(device_cfg.is_rc) begin
       repeat(1)begin
         `uvm_do_with(req,{req.pkt_type == 2;             //memory write
@@ -922,22 +980,12 @@ class seq_compare_and_swap extends siv_pcie_tl_seq;
                           req.header_mem.first_dw== 4'b1111;
                           req.header_mem.last_dw== 4'b1111;
                           req.header_mem.address1 == 32'h0000_3000;
-                          req.header_mem.len ==1;
-                          req.payload_m[0] == 32'h0011_2233;// a dummy write at address
+                          req.header_mem.len ==8;
+                          //req.payload_m[0] == 32'h0011_2233;// a dummy write at address
                           req.payload_m.size() == req.header_mem.len;});
-      end
-//       repeat(1)begin
-//         `uvm_do_with(req,{req.pkt_type == 2;             //memory read to check 
-//                           req.header_mem.typef == 0;
-//                           req.header_mem.fmt == 0;
-//                           req.header_mem.td == 0;
-// //                           req.header_mem.requester_id==34;
-//                           req.header_mem.first_dw==15;
-//                           req.header_mem.last_dw==15;
-//                           req.header_mem.address1 == 32'h0000_3000;
-//                           req.header_mem.len ==1;
-//                           req.payload_m.size() == req.header_mem.len;});
-//       end
+      	que = req.payload_m;
+	end
+
       repeat(1)begin
         `uvm_do_with(req,{req.pkt_type == 2;             //memory read to check 
                           req.header_mem.typef == 5'b01110;
@@ -947,7 +995,32 @@ class seq_compare_and_swap extends siv_pcie_tl_seq;
                           req.header_mem.first_dw==15;
                           req.header_mem.last_dw==15;
                           req.header_mem.address1 == 32'h0000_3000;
-                          req.header_mem.len ==2;
+                          req.header_mem.len == 2;
+                          req.payload_m[0] == que[0];
+                          req.payload_m.size() == req.header_mem.len;});
+
+        `uvm_do_with(req,{req.pkt_type == 2;             //memory read to check 
+                          req.header_mem.typef == 5'b01110;
+                          req.header_mem.fmt == 2;
+                          req.header_mem.td == 0;
+//                           req.header_mem.requester_id==34;
+                          req.header_mem.first_dw==15;
+                          req.header_mem.last_dw==15;
+                          req.header_mem.address1 == 32'h0000_3000;
+                          req.header_mem.len ==4;
+                          req.payload_m[0]==32'h3322_1100;
+                          req.payload_m[1]==32'h0022_3344;
+                          req.payload_m.size() == req.header_mem.len;});
+
+        `uvm_do_with(req,{req.pkt_type == 2;             //memory read to check 
+                          req.header_mem.typef == 5'b01110;
+                          req.header_mem.fmt == 2;
+                          req.header_mem.td == 0;
+//                           req.header_mem.requester_id==34;
+                          req.header_mem.first_dw==15;
+                          req.header_mem.last_dw==15;
+                          req.header_mem.address1 == 32'h0000_3000;
+                          req.header_mem.len ==8;
                           req.payload_m[0]==32'h3322_1100;
                           req.payload_m[1]==32'h0022_3344;
                           req.payload_m.size() == req.header_mem.len;});

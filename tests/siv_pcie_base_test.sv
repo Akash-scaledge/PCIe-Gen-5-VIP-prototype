@@ -120,5 +120,18 @@ class siv_pcie_base_test extends uvm_test;
     join
   endtask
 
+	function void check();
+		if(rc_tlp_sent == ep_tlp_receive)
+			`uvm_info("Equal",$sformatf("RC sent %0d, EP receive %0d", rc_tlp_sent,ep_tlp_receive),UVM_NONE)
+		else
+			`uvm_warning("Not Equal",$sformatf("RC sent %0d, EP receive %0d", rc_tlp_sent,ep_tlp_receive))
+		
+
+		if(ep_tlp_sent == rc_tlp_receive)
+			`uvm_info("Equal",$sformatf("EP sent %0d, RC receive %0d", ep_tlp_sent,rc_tlp_receive),UVM_NONE)
+		else
+			`uvm_warning("Not Equal",$sformatf("EP sent %0d, RC receive %0d", ep_tlp_sent,rc_tlp_receive))
+	endfunction
+
 endclass
 //--------------------------------------------------------------

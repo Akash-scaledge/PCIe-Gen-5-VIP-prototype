@@ -149,6 +149,10 @@ endclass
 `include "siv_pcie_device_agent.sv"
 `include "siv_pcie_env.sv"
 `include "siv_pcie_base_test.sv"
+`include "siv_pcie_unconditional_swap_atomicop_test.sv"
+`include "siv_pcie_unconditional_swap_atomicop_64_test.sv"
+`include "siv_pcie_fetchadd_test.sv"
+`include "siv_pcie_CAS_atomicop_test.sv"
 
 //======================================================
 // Data Link Layer tests (tests/dl)

@@ -171,7 +171,8 @@ class siv_pcie_tl_sequence_items extends uvm_sequence_item;
   //Randomised values of routing for message
   rand bit [2:0] r;
   //flag_type
-  rand int pkt_type;  //1 -:config_pkt
+  rand int pkt_type;  
+  //1 -:config_pkt
   //2 -:mem_pkt
   //3 -:io_pkt
   //4 -:cpl_pkt  
@@ -242,7 +243,7 @@ class siv_pcie_tl_sequence_items extends uvm_sequence_item;
           if(header_mem.fmt[0]==0)begin
             headerQ.delete(2);
           end
-          `uvm_info("seq_ityem",$sformatf("header	%0p",headerQ),UVM_NONE);
+          `uvm_info("seq_item",$sformatf("header	%0p",headerQ),UVM_NONE);
 
           if(prefix[0][28]==1)begin
             prefix_temp={prefix,headerQ};
@@ -268,7 +269,8 @@ class siv_pcie_tl_sequence_items extends uvm_sequence_item;
               headerQ.delete(2);
             end
 
-            `uvm_info("seq_ityem",$sformatf("header	%0p",headerQ),UVM_NONE);
+            `uvm_info("seq_item",$sformatf("header	%0p",headerQ),UVM_NONE);
+            `uvm_info("seq_item",$sformatf("header mem	%0p",header_mem),UVM_NONE);
 
             if(prefix[0][28]==1)begin
               prefix_temp={prefix,headerQ};
@@ -323,7 +325,8 @@ class siv_pcie_tl_sequence_items extends uvm_sequence_item;
               headerQ.delete(2);
             end
 
-            `uvm_info("seq_ityem",$sformatf("header	%0p",headerQ),UVM_NONE);
+            `uvm_info("seq_item",$sformatf("header	%0p",headerQ),UVM_NONE);
+            `uvm_info("seq_item",$sformatf("header mem	%0p",header_mem),UVM_NONE);
 
             if(prefix[0][28]==1)begin
               prefix_temp={prefix,headerQ};
@@ -373,8 +376,6 @@ class siv_pcie_tl_sequence_items extends uvm_sequence_item;
     
     //Message code finished
     `uvm_info("seq_item print",$sformatf("header %p  TLP_msg %p",header_msg,TLP_msg),UVM_NONE)
-    //Message code Print
-    
     `uvm_info("seq_item print",$sformatf("header %p  TLP_m %p",header_mem,TLP_m),UVM_NONE)
     `uvm_info("seq_item print",$sformatf("header %p  TLP_i %p",header_io,TLP_i),UVM_NONE)
     `uvm_info("seq_item print",$sformatf("header %p  TLP_c %p",header_config,TLP_c),UVM_NONE)
@@ -496,6 +497,18 @@ class siv_pcie_tl_sequence_items extends uvm_sequence_item;
   }
   
   
+
+ //Constraint for AtomicOP
+
+constraint atomic_op_c
+{
+ header_mem.typef == 12 -> header_mem.len inside {1,2};
+ header_mem.typef == 13 -> header_mem.len inside {1,2};
+ header_mem.typef == 14 -> header_mem.len inside {2,4,8};
+}
+
+
+
   
   //Constraint for MPS
   /********added******/

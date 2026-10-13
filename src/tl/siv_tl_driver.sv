@@ -131,7 +131,13 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
   virtual siv_tl_if        vif;
   timer_uvm_tl              state_timer;
   siv_tl_cfg                 device_cfg;
-  // Constructor
+
+
+
+
+
+
+	// Constructor
   function new(string name, uvm_component parent);
     super.new(name, parent);
   endfunction
@@ -231,16 +237,17 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
 //         if(vif.rst == 0);
 //         tl_driver_dl_put_port.put(dl_rc_sending_que);
         dw_pkt::put_q(tl_driver_dl_put_port, dl_rc_sending_que);
+      	rc_tlp_sent++;
         // Drives actual signals
         //it is blocking to send next pkt
         `uvm_info("here0","here",UVM_NONE)
 
 
-        if(((req.TLP_m[0][28:24]==5'b0 && req.TLP_m[0][30]== 1'b0)||req.TLP_c[0][28:24]== 4||req.TLP_i[0][28:24]== 2 || req.TLP_m[0][28:24]==12)&& req.pkt_type!=5) begin
+        if(((req.TLP_m[0][28:24]==5'b0 && req.TLP_m[0][30]== 1'b0)||req.TLP_c[0][28:24]== 4||req.TLP_i[0][28:24]== 2 || req.TLP_m[0][28:24] inside {12, 13 ,14})&& req.pkt_type!=5) begin
           // Compute expected_splits based on req.header_mem.len and RCB
 
-          `uvm_info("here0",$sformatf("%0d",flag),UVM_NONE)
-          wait(flag==0);
+          `uvm_info("here0",$sformatf("before flag cleared %0d",flag),UVM_NONE)
+          //wait(flag==0);
           `uvm_info("here0","here",UVM_NONE)
 
           flag=1;
@@ -290,27 +297,99 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
 //         @(posedge vif.clk);
         //config pkt transmission is Done
         //->clps_done; //clps_done trigger after the sending the pkt only
-      end
+			end
     end
     //logic for the compl pkt from Ep
     else if(!(device_cfg.is_rc))begin 
+
       forever begin
-        //wait untill  non-posted pkt received at ep
-        wait(pktc_done.triggered);  
-        `uvm_info("max meter","at wait",UVM_NONE)
-        TLP_comp_pkt.delete();  // delete the before completion created 
+        siv_pcie_tl_sequence_items req;
+        seq_item_port.get_next_item(req);
+        `uvm_info("here0","here",UVM_NONE)
+        if(req.pkt_type==1) dl_ep_sending_que=req.TLP_c;
+        else if(req.pkt_type==2) dl_ep_sending_que=req.TLP_m;
+        else if(req.pkt_type==3) dl_ep_sending_que=req.TLP_i;
+        else if(req.pkt_type==5) dl_ep_sending_que=req.TLP_msg;
+//         if(vif.rst == 0);
+//         tl_driver_dl_put_port.put(dl_ep_sending_que);
+        dw_pkt::put_q(tl_driver_dl_put_port, dl_ep_sending_que);
+      	ep_tlp_sent++;
+        // Drives actual signals
+        //it is blocking to send next pkt
+        `uvm_info("here0","here",UVM_NONE)
 
-        // **Pre-completion TC-VC setup**
-        pre_completion_tc_vc_setup();
 
-        compl_header_formation(); // create the cpl pkt based on the pkt received
+        if(((req.TLP_m[0][28:24]==5'b0 && req.TLP_m[0][30]== 1'b0)||req.TLP_c[0][28:24]== 4||req.TLP_i[0][28:24]== 2 || req.TLP_m[0][28:24] inside {12, 13 ,14})&& req.pkt_type!=5) begin
+          // Compute expected_splits based on req.header_mem.len and RCB
 
-        if (typef_temp==4)drive_config_comp(); // if the pkt is cpl the it transmit to rc
-        //else if (typef_temp== 0 && fmt_temp==0 )drive_mem_comp();
-        else if (typef_temp== 2) drive_io_comp();
-        //  else if (typef_temp== 0 || typef==5'b011_00 || typef==5'b011_01 || typef==5'b011_10)drive_mem_comp();
+          `uvm_info("here0",$sformatf("before flag cleared %0d",flag),UVM_NONE)
+          //wait(flag==0);
+          `uvm_info("here0","here",UVM_NONE)
 
+          flag=1;
+          if(device_cfg.get_rcb()) begin 
+            $display("->get_rcb = %0d",device_cfg.get_rcb());
+            RCB=128;
+            $display("->151 get_rcb = %0d",RCB);
+          end
+          else begin
+            $display("->get_rcb = %0d",device_cfg.get_rcb());
+            RCB=64;
+            $display("-> get_rcb = %0d",RCB);
+          end 
+
+          rcb_size=RCB/4;
+
+          if(req.TLP_c[0][28:24]== 4||req.TLP_i[0][28:24]== 2)
+            begin
+              expected_splits=1;
+              $display("no_of splits = 1");
+              cfg_sem.get();
+              $display("-----------------211----------->received_splits=%0d,expected_splits=%0d",received_splits,expected_splits);
+            end
+          else if(req.TLP_m[0][28:24]==5'b0)
+            begin
+              //  expected_splits = (req.TLP_m[0][9:0] + 16 - 1) / 16;  //expected_splits = (req.header_mem.len + RCB_size - 1) / RCB_size;	            
+              expected_splits = (req.TLP_m[0][9:0] + rcb_size - 1) / rcb_size;
+              cfg_sem.get();
+              $display("-----------------219----------->received_splits=%0d,expected_splits=%0d",received_splits,expected_splits);
+            end
+
+        end
+
+        `uvm_info(get_type_name(), $sformatf("RC sent config pkt seq_item:\n%s",     req.sprint()), UVM_LOW)
+        //         req.print();
+        // **Pre-packet TC-VC setup**
+        pre_packet_tc_vc_setup(req);
+        `uvm_info("here","here",UVM_NONE)
+
+//         drive_tx(req);
+        `uvm_info("here","here",UVM_NONE)
+
+        /*  if(req.TLP_m[0][28:24]==5'b0 && req.TLP_m[0][30]== 1'b1) begin
+          cfg_sem.put(); //need to improve that
+        end*/
+        seq_item_port.item_done();
+//         @(posedge vif.clk);
+        //config pkt transmission is Done
+        //->clps_done; //clps_done trigger after the sending the pkt only
+				//
       end
+        //wait untill  non-posted pkt received at ep
+        //wait(pktc_done.triggered);  
+//        `uvm_info("max meter","at wait",UVM_NONE)
+//        TLP_comp_pkt.delete();  // delete the before completion created 
+//
+//        // **Pre-completion TC-VC setup**
+//        pre_completion_tc_vc_setup();
+//
+//        compl_header_formation(); // create the cpl pkt based on the pkt received
+//
+//        if (typef_temp==4)drive_config_comp(); // if the pkt is cpl the it transmit to rc
+//        //else if (typef_temp== 0 && fmt_temp==0 )drive_mem_comp();
+//        else if (typef_temp== 2) drive_io_comp();
+//        //  else if (typef_temp== 0 || typef==5'b011_00 || typef==5'b011_01 || typef==5'b011_10)drive_mem_comp();
+//
     end
   endtask
 
@@ -414,8 +493,9 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
                       end
 
                     tl_ep_getting_que.delete();       // after unpaking the pkt Deleting that tl_ep_getting_que
-                    ->pktc_done;               // receiving of completion pkt is done   
-                    `uvm_info("max config write","5000",UVM_NONE)
+                    //->pktc_done;               // receiving of completion pkt is done   
+                  	compl_header_formation();  
+										`uvm_info("max config write","5000",UVM_NONE)
                   end
                 //               end  
                 else if (tl_ep_getting_que[0][31:29] == 0)
@@ -427,7 +507,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
                     unpack();        // Unpaking the pkt
                     display_pkt();   // Displaying the PKT
                     tl_ep_getting_que.delete();    // after unpaking the pkt Deleting that tl_ep_getting_que
-                    ->pktc_done;            // receiving of completion pkt is done   
+                    //->pktc_done;            // receiving of completion pkt is done   
+                  	compl_header_formation();  
                     `uvm_info("max run line 1","5000",UVM_NONE)
                     //                 `uvm_info("shark",$sformatf("unpacking %0d",first_dw_be),UVM_NONE)
                   end
@@ -476,7 +557,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
                         mem_write();
                         if(typef inside {12,13,14})
                           begin
-                            ->pktc_done;
+                            //->pktc_done;
+                  					compl_header_formation();  
                             `uvm_info("max run line 3","5000",UVM_NONE)
                           end
                       end
@@ -499,7 +581,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
                     display_pkt();   // Displaying the PKT
                     tl_ep_getting_que.delete();    // after unpaking the pkt Deleting that tl_ep_getting_que
                     //                       count = 0;
-                    ->pktc_done;
+                    //->pktc_done;
+                  	compl_header_formation();  
                     `uvm_info("max run line 5","5000",UVM_NONE)
 
                     //                 `uvm_info("shark",$sformatf("unpacking %0d",first_dw_be),UVM_NONE)
@@ -528,7 +611,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
 
                     count = 0;                  // need to store the IO pkt in one place 
                     tl_ep_getting_que.delete();       // after unpaking the pkt Deleting that tl_ep_getting_que
-                    ->pktc_done;               // receiving of completion pkt is done   
+                    //->pktc_done;               // receiving of completion pkt is done   
+                  	compl_header_formation();  
                     `uvm_info("max run line 6","5000",UVM_NONE)
 
                   end
@@ -544,7 +628,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
                     display_pkt();   // Displaying the PKT
                     count = 0;
                     tl_ep_getting_que.delete();    // after unpaking the pkt Deleting that tl_ep_getting_que
-                    ->pktc_done;            // receiving of completion pkt is done   
+                    //->pktc_done;            // receiving of completion pkt is done   
+                  	compl_header_formation();  
                     `uvm_info("max run line 7","5000",UVM_NONE)
 
                   end
@@ -555,6 +640,7 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
               end
 
 
+      	ep_tlp_receive++;
           end 
       end
     // Logic for the receiving the compl pkt rc
@@ -568,7 +654,7 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
       // rx_cpl_pkt.delete();
       forever
         begin     
-          @(posedge vif.clk);
+          //@(posedge vif.clk);
 
           //           if(vif.rx_data!=0)
             begin
@@ -577,48 +663,48 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
 //               tl_driver_dl_get_port.get(tl_rc_getting_que);
               `uvm_info("INSIDE TL DRIVER",$sformatf("The RC Got the completion=%p",tl_rc_getting_que),UVM_NONE)
 
-              rx_cpl_pkt.push_back(vif.rx_data); // tl_ep_getting_que in this queue, storing the rx_data
+              //rx_cpl_pkt.push_back(vif.rx_data); // tl_rc_getting_que in this queue, storing the rx_data
 
-              `uvm_info("pkt info",$sformatf("size %0d  rx_tlp=%p",tl_ep_getting_que.size,tl_ep_getting_que),UVM_NONE)
+              `uvm_info("pkt info",$sformatf("size %0d  rx_tlp=%p",tl_rc_getting_que.size,tl_rc_getting_que),UVM_NONE)
 
               //             `define pkt_len(PAYLOAD, HS, LENGTH, TD)  // (30, 29, [9:0], 15)
-              `pkt_len(rx_cpl_pkt[0][30], rx_cpl_pkt[0][29], rx_cpl_pkt[0][9:0], rx_cpl_pkt[0][15])
+             // `pkt_len(rx_cpl_pkt[0][30], rx_cpl_pkt[0][29], rx_cpl_pkt[0][9:0], rx_cpl_pkt[0][15])
 
-              for(int i=0; i < pkt_len - 1; i++)
-                begin
-                  @(posedge vif.clk)
-                  #0
-                  //                   `uvm_info("pkt info",$sformatf("size %0d  rx_tlp=%p",rx_cpl_pkt.size,rx_cpl_pkt),UVM_NONE)
-                  rx_cpl_pkt.push_back(vif.rx_data);
-                end
-              `uvm_info("pkt info",$sformatf("size %0d  rx_tlp=%p",rx_cpl_pkt.size,rx_cpl_pkt),UVM_NONE)
+             // for(int i=0; i < pkt_len - 1; i++)
+             //   begin
+             //     @(posedge vif.clk)
+             //     #0
+             //     //                   `uvm_info("pkt info",$sformatf("size %0d  rx_tlp=%p",rx_cpl_pkt.size,rx_cpl_pkt),UVM_NONE)
+             //     rx_cpl_pkt.push_back(vif.rx_data);
+             //   end
+              //`uvm_info("pkt info",$sformatf("size %0d  rx_tlp=%p",rx_cpl_pkt.size,rx_cpl_pkt),UVM_NONE)
 
-              `uvm_info("pkt info",$sformatf("0th place %0h",rx_cpl_pkt[0][28:24]),UVM_NONE)
+              //`uvm_info("pkt info",$sformatf("0th place %0h",rx_cpl_pkt[0][28:24]),UVM_NONE)
 
 
 
-              if (rx_cpl_pkt[0][28:24] == 10) begin     // checking for pket is completion
+              if (tl_rc_getting_que[0][28:24] == 10) begin     // checking for pkt is completion
                 `uvm_info("flag","pass3",UVM_NONE)
-                if (rx_cpl_pkt[0][31:29] == 0) begin   // checking for pkt is cpl
+                if (tl_rc_getting_que[0][31:29] == 0) begin   // checking for pkt is cpl
 
                   // Extract and validate TC from completion
-                  validate_tc_vc_before_packet(rx_cpl_pkt[0][22:20], "RX_COMPLETION");
+                  validate_tc_vc_before_packet(tl_rc_getting_que[0][22:20], "RX_COMPLETION");
 
-                  `uvm_info("RC RECEIVE CONFIG COMP", $psprintf("rx_cpl_pkt=%p", rx_cpl_pkt), UVM_LOW)
-                  rx_cpl_pkt.delete();   
+                  `uvm_info("RC RECEIVE CONFIG COMP", $psprintf("tl_rc_getting_que=%p", tl_rc_getting_que), UVM_LOW)
+                  tl_rc_getting_que.delete();   
                   received_splits=0;
                   flag=0;
                   cfg_sem.put();  // after receiving the cpl then only put the key
                 end          
 
-                if (rx_cpl_pkt[0][31:29] == 2) begin   // checking for pkt is cplD
+                if (tl_rc_getting_que[0][31:29] == 2) begin   // checking for pkt is cplD
                   // Extract and validate TC from completion
-                  validate_tc_vc_before_packet(rx_cpl_pkt[0][22:20], "RX_COMPLETION_DATA");
+                  validate_tc_vc_before_packet(tl_rc_getting_que[0][22:20], "RX_COMPLETION_DATA");
                   received_splits++;
 
                   //                   `uvm_info("flag",$sformatf("recieved_split %0d, expected split %0d", received_splits, expected_splits),UVM_NONE)
-                  `uvm_info("RC RECEIVE CONFIG COMP", $psprintf("rx_cpl_pkt=%p", rx_cpl_pkt), UVM_LOW)
-                  rx_cpl_pkt.delete();   
+                  `uvm_info("RC RECEIVE CONFIG COMP", $psprintf("tl_rc_getting_que=%p", tl_rc_getting_que), UVM_LOW)
+                  tl_rc_getting_que.delete();   
                   $display("-----------------491----------->received_splits=%0d,expected_splits=%0d",received_splits,expected_splits);
                   if (received_splits == expected_splits) begin
                     received_splits=0;
@@ -629,6 +715,7 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
                 end
               end
             end
+      		rc_tlp_receive++;
         end
     end
   endtask
@@ -1099,7 +1186,8 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
               fetch_data = {96'd0,mem_space[start_add+3],mem_space[start_add+2],mem_space[start_add+1],mem_space[start_add]};
               if(typef==12){mem_space[start_add+3],mem_space[start_add+2],mem_space[start_add+1],mem_space[start_add]} += payload[0];
               if(typef==13){mem_space[start_add+3],mem_space[start_add+2],mem_space[start_add+1],mem_space[start_add]} = payload[0];
-            end
+	      `uvm_info("fetch_data",$sformatf("data is %0h",fetch_data),UVM_NONE);            
+	    end
           else if(len==2)
             begin
 
@@ -1338,6 +1426,13 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
     else if(at>0) completion_status=3;
     else completion_status=0;
 
+	`uvm_info("SHARK_COMP","completion hit",UVM_NONE)
+
+	if(device_cfg.is_rc)
+		rc_tlp_sent++;
+	else
+		ep_tlp_sent++;
+
     response_vc = get_vc_for_tc(tc);
     //-----changed start
     if(fmt inside {0, 2})
@@ -1346,7 +1441,7 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
       address={address_upper,address_lower}; 
     `uvm_info("address update",$sformatf("%0h fmt %0d",address,fmt),UVM_NONE)
     ////-----changed end    
-    if(typef==4) begin
+    if(typef==4) begin //config
       typef_temp = typef;
       typef = 10;
       completer_id = 0;
@@ -1392,7 +1487,7 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
     //////////-------------------------------------------------------------------------------------------////////////////
 
 
-    else if((typef==0 && fmt==0 || fmt==1) || typef inside {12,13,14}) begin
+    else if((typef==0 && fmt==0 || fmt==1) || typef inside {12,13,14}) begin // Memory, AtomicOp
       typef_temp = typef;
       fmt_temp = fmt;
       typef = 10;
@@ -1685,7 +1780,7 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
             end */
             //  `uvm_info("EP SIDE TLP_STORAGE",$psprintf("###############TLP_storage=%p########################",TLP_storage),UVM_FULL)
             `uvm_info("EP SEND MEMORY COMP - LAST SPLIT", "", UVM_LOW)
-            drive_mem_comp();
+            //drive_mem_comp();
           end
         end
       end
@@ -2103,5 +2198,17 @@ class siv_pcie_tl_driver extends uvm_driver #(siv_pcie_tl_sequence_items);
         `uvm_error("INTR_PIN", "intr_pin_reg write failed")
         reg_model.mod_reg.intr_pin_reg.print();
   endtask
+
+
+
+
+
+
+
+
+
+
+
+
 endclass
 
