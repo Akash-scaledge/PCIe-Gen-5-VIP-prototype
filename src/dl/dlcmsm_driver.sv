@@ -95,6 +95,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   // NEW: Replay mode flag and queue for replayed TLPs
   bit replay_mode = 0;  // Flag to indicate if replay is active
   pcie_dl_seq_item replay_queue[$];  // Queue to hold TLPs for replay
+  bit replay_requested = 0;  // Nak / REPLAY_TIMER expiry during a replay: replay again when it is done
 
   // Device-specific sequence tracking
   bit [11:0] my_device_tx_seq_num = 0;bit f_rcd;
@@ -476,10 +477,11 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                      $sformatf("Device %0d: REPLAY_TIMER expired! Initiating replay",
                                cfg.device_id));
 
-        handle_replay_timer_expiration();
-
+        // clear first: the replay below restarts the timer
         replay_timer_running = 0;
         replay_timer.done_flag = 0;
+
+        handle_replay_timer_expiration();
       end
     end
   endtask
@@ -487,30 +489,49 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
 
   //--------------------------------------------------------------------------
   // Replay Timer Expiration Handler
-  // Description:
-  //   - Increments REPLAY_NUM
-  //   - Initiates replay or forces link retrain on overflow
+  //   Spec: replay every unacknowledged TLP (see start_replay)
   //--------------------------------------------------------------------------
   task handle_replay_timer_expiration();
-    REPLAY_NUM = REPLAY_NUM + 1;
+    start_replay("REPLAY_TIMER expired");
+  endtask
 
-    `uvm_info("REPLAY_TIMER",
-              $sformatf("Device %0d: REPLAY_NUM incremented to %0d",
-                        cfg.device_id, REPLAY_NUM),
-              UVM_LOW);
 
-    // After 4 failed replay attempts, force link retrain
-    if (REPLAY_NUM == 2'b00) begin // rollover from 11b to 00b
+  //--------------------------------------------------------------------------
+  // Task: start_replay
+  //   Common replay entry for Nak and REPLAY_TIMER expiry:
+  //   - a replay already in progress is finished first; one more replay is
+  //     then started (replay_requested)
+  //   - nothing to replay -> nothing to do
+  //   - REPLAY_NUM is incremented; on rollover 11b -> 00b the Physical Layer
+  //     must retrain the link (not modelled yet: uvm_error only)
+  //   - every TLP not yet acknowledged is replayed, oldest first
+  //     (from ACKD_SEQ + 1), and REPLAY_TIMER is restarted
+  //--------------------------------------------------------------------------
+  task start_replay(string reason);
+    bit [11:0] from_seq;
+    if (replay_mode) begin
+      replay_requested = 1;
+      `uvm_info("REPLAY", $sformatf("Device %0d: %s during a replay - will replay again after the current one", cfg.device_id, reason), UVM_LOW);
+      return;
+    end
+    if (pcie_dl_seq_item::get_replay_count_static(cfg.device_id) == 0) begin
+      `uvm_info("REPLAY", $sformatf("Device %0d: %s - replay buffer empty, nothing to replay", cfg.device_id, reason), UVM_LOW);
+      stop_replay_timer();
+      return;
+    end
+    if (REPLAY_NUM == 2'b11) begin
       `uvm_error("REPLAY_TIMER",
-                 $sformatf("Device %0d: REPLAY_NUM overflow! 4 failed attempts - forcing link retrain",
-                           cfg.device_id));
+                 $sformatf("Device %0d: REPLAY_NUM rollover (11b -> 00b) on %s - 4 replays without forward progress",
+                           cfg.device_id, reason));
       force_link_retrain();
     end
-    else begin
-      // Replay outstanding unacknowledged TLPs
-      initiate_buffer_replay();
-      start_replay_timer();
-    end
+    REPLAY_NUM = REPLAY_NUM + 1;
+    from_seq = ACKD_SEQ + 12'd1;   // oldest unacknowledged TLP
+    `uvm_info("REPLAY", $sformatf("Device %0d: %s - replaying from seq_num %0d, REPLAY_NUM=%0d",
+                                  cfg.device_id, reason, from_seq, REPLAY_NUM), UVM_LOW);
+    initiate_buffer_replay(from_seq);
+    stop_replay_timer();
+    start_replay_timer();
   endtask
 
   // Utility Functions
@@ -524,10 +545,29 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     return (diff >= 2048);
   endfunction
 
+  // Spec: on REPLAY_NUM rollover the Physical Layer retrains the link and the
+  // replay follows. Retrain is not modelled yet: report it and go on with the
+  // replay so the simulation continues.
   task force_link_retrain();
-    `uvm_error("LINK_RETRAIN", $sformatf("Device %0d: Forcing link retrain due to REPLAY_NUM overflow", cfg.device_id));
-    // Implementation would signal Physical Layer to enter Recovery state
+    `uvm_error("LINK_RETRAIN", $sformatf("Device %0d: REPLAY_NUM rollover - link retrain required (not modelled; replay continues)", cfg.device_id));
   endtask
+
+  // AckNak_Seq_Num must be ACKD_SEQ or the sequence number of an
+  // unacknowledged TLP; anything else is a Data Link protocol error.
+  function bit acknak_seq_valid(bit [11:0] seq);
+    bit [11:0] d, outstanding;
+    d           = seq - ACKD_SEQ;
+    outstanding = NEXT_TRANSMIT_SEQ - 12'd1 - ACKD_SEQ;   // TLPs sent but not acknowledged
+    return (d <= outstanding);
+  endfunction
+
+  // TLP with sequence number seq is still unacknowledged
+  function bit seq_unacked(bit [11:0] seq);
+    bit [11:0] d, outstanding;
+    d           = seq - ACKD_SEQ;
+    outstanding = NEXT_TRANSMIT_SEQ - 12'd1 - ACKD_SEQ;
+    return (d != 0 && d <= outstanding);
+  endfunction
 
   task initiate_buffer_replay(bit [11:0] start_seq_num = 0);
     pcie_dl_seq_item replay_items[$];
@@ -646,11 +686,18 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
       if (replay_mode) begin
         if (replay_queue.size() > 0) begin
           req = replay_queue.pop_front();
-          send_replay_tlp(req, phase);
+          if (seq_unacked(req.seq_num))
+            send_replay_tlp(req, phase);
+          else
+            `uvm_info("REPLAY", $sformatf("Device %0d: seq_num %0d was acknowledged during the replay - not resent", cfg.device_id, req.seq_num), UVM_LOW)
         end
         if (replay_queue.size() == 0) begin
           replay_mode = 0;
           `uvm_info("REPLAY", $sformatf("Device %0d: Replay completed, exiting replay mode", cfg.device_id), UVM_LOW);
+          if (replay_requested) begin
+            replay_requested = 0;
+            start_replay("Nak/REPLAY_TIMER during the previous replay");
+          end
         end
         continue;
       end
@@ -1064,18 +1111,26 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
           received_lcrc = rx_lcrc;
 //           $display("989898988989898989898989989898989898");
 
+          // Nullified TLP (LCRC inverted): discard silently - NEXT_RCV_SEQ
+          // unchanged, no Ack/Nak
           if(computed_lcrc == ~received_lcrc)begin
             received_seq = sq_n;
-            `uvm_warning("LCRC",$sformatf("Device %0d: Nulified TLP seq_num %0d received LCRC inverted! Computed=%h Received=%h  - Dropping nulified TLP", cfg.device_id, received_seq, computed_lcrc, received_lcrc));
-            next_rcv_seq = (next_rcv_seq + 1) % 4096;
+            `uvm_warning("LCRC",$sformatf("Device %0d: Nulified TLP seq_num %0d received LCRC inverted! Computed=%h Received=%h  - Dropping nulified TLP (NEXT_RCV_SEQ stays %0d)", cfg.device_id, received_seq, computed_lcrc, received_lcrc, next_rcv_seq));
           end
 
+          // Bad LCRC: discard; Nak NEXT_RCV_SEQ - 1 unless a Nak is already
+          // scheduled (NAK_SCHEDULED is cleared by the next good TLP)
           else if (computed_lcrc != received_lcrc) begin
             `uvm_error("LCRC", $sformatf("Device %0d: LCRC mismatch! Computed=%h Received=%h - Dropping TLP", cfg.device_id, computed_lcrc, received_lcrc));
-            nak_scheduled = 1;
-            ack_timer_running = 0;
-            acknak_latency_timer.stop_timer();
-            schedule_nak(next_rcv_seq - 1);
+            if (!nak_scheduled) begin
+              nak_scheduled = 1;
+              ack_timer_running = 0;
+              acknak_latency_timer.stop_timer();
+              schedule_nak(next_rcv_seq - 12'd1);
+            end
+            else begin
+              `uvm_info("LCRC", $sformatf("Device %0d: NAK already scheduled - no new NAK", cfg.device_id), UVM_LOW);
+            end
           end
           else begin
             received_seq = sq_n;
@@ -1259,8 +1314,12 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                         $sformatf("Device %0d RX ACK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
                                   cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
 
+              if (!acknak_seq_valid(rx_item.acknak_pkt.seq_num)) begin
+                `uvm_error("DL_PROTOCOL", $sformatf("Device %0d: Ack for seq_num %0d which was never sent (ACKD_SEQ=%0d NEXT_TRANSMIT_SEQ=%0d) - discarded",
+                                                    cfg.device_id, rx_item.acknak_pkt.seq_num, ACKD_SEQ, NEXT_TRANSMIT_SEQ));
+              end
               // Check for forward progress
-              if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
+              else if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
                 `uvm_info("ACK_PROGRESS", $sformatf("Device %0d: Forward progress detected! ACK seq='h%h > last_ack='h%h", 
                                                     cfg.device_id, rx_item.acknak_pkt.seq_num, ACKD_SEQ), UVM_LOW);
 
@@ -1290,18 +1349,23 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
                         $sformatf("Device %0d RX NAK DLLP: seq_num=%0d, rsvd='h%0h, CRC_Valid=%0b", 
                                   cfg.device_id, rx_item.acknak_pkt.seq_num, rx_item.acknak_pkt.rsvd, crc_valid), UVM_LOW);
 
-              //Check for forward progress first
-              if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
-                ACKD_SEQ = rx_item.acknak_pkt.seq_num;
-                last_ackd_seq = ACKD_SEQ;
-                REPLAY_NUM = 2'b00;
-                stop_replay_timer();
-                rx_item.clear_replay_buffer_up_to_ack(cfg.device_id, ACKD_SEQ);
+              if (!acknak_seq_valid(rx_item.acknak_pkt.seq_num)) begin
+                `uvm_error("DL_PROTOCOL", $sformatf("Device %0d: Nak for seq_num %0d which was never sent (ACKD_SEQ=%0d NEXT_TRANSMIT_SEQ=%0d) - discarded",
+                                                    cfg.device_id, rx_item.acknak_pkt.seq_num, ACKD_SEQ, NEXT_TRANSMIT_SEQ));
               end
-
-              // Initiate replay regardless of forward progress
-              REPLAY_NUM = REPLAY_NUM + 1;
-              handle_nak_replay(rx_item.acknak_pkt.seq_num);
+              else begin
+                // A Nak also acknowledges every TLP up to AckNak_Seq_Num
+                if (is_forward_progress(rx_item.acknak_pkt.seq_num)) begin
+                  ACKD_SEQ = rx_item.acknak_pkt.seq_num;
+                  last_ackd_seq = ACKD_SEQ;
+                  REPLAY_NUM = 2'b00;
+                  stop_replay_timer();
+                  rx_item.clear_replay_buffer_up_to_ack(cfg.device_id, ACKD_SEQ);
+                end
+                // then all TLPs that are still unacknowledged are replayed
+                // (REPLAY_NUM is incremented in start_replay)
+                handle_nak_replay(rx_item.acknak_pkt.seq_num);
+              end
             end
 
             // DLLP types
@@ -1612,9 +1676,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
 
   //NAK replay handling
   task handle_nak_replay(bit [11:0] nak_seq_num);
-    replay_mode = 1;  // Ensure replay mode is active
-    initiate_buffer_replay(nak_seq_num+1);
-    start_replay_timer();
+    start_replay($sformatf("Nak (AckNak_Seq_Num %0d)", nak_seq_num));
   endtask
 
 
