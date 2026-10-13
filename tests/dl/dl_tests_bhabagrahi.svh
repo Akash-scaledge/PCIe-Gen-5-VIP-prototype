@@ -14,22 +14,38 @@
 
 //------------------------------------------------------------------------------
 // dl_replay_timeout_test
-//   Inject: every ACK DLLP that EP sends gets a bad CRC, so RC drops it.
+//   Inject: the first max_bad_acks ACK DLLPs that EP sends get a bad CRC, so
+//   RC drops them. After that EP's ACKs are good again.
 //   Spec: RC's REPLAY_TIMER expires; RC replays ALL unacknowledged TLPs from
 //   the replay buffer, oldest first, with their original sequence numbers and
-//   contents; REPLAY_NUM increments on each replay.
+//   contents; REPLAY_NUM increments on each replay. The first good ACK is
+//   forward progress: RC purges the replay buffer, REPLAY_NUM goes back to 0
+//   and the replays stop.
+//
+//   Sizing max_bad_acks: EP sends 1 ACK for the original TLPs, then 1 ACK per
+//   duplicate TLP of every replay round (2 TLPs outstanding -> 2 ACKs/round).
+//     max_bad_acks = 1 -> 1 REPLAY_TIMER expiry, recovery on the 1st replay
+//     max_bad_acks = 7 -> 4 expiries, REPLAY_NUM rollover (LINK_RETRAIN error)
+//     max_bad_acks < 0 -> every ACK corrupted: replays never stop and the run
+//                         ends only at UVM_TIMEOUT (the old behaviour)
 //------------------------------------------------------------------------------
 class dl_drop_ack_rec extends dl_tx_recorder;
   `uvm_object_utils(dl_drop_ack_rec)
+  static int max_bad_acks = 1;   // ACK DLLPs to corrupt (< 0 = all of them)
+  int        n_bad_acks;         // ACK DLLPs corrupted so far
+
   function new(string name = "dl_drop_ack_rec");
     super.new(name);
   endfunction
+
   function bit inject(ref pcie_dl_seq_item item);
     if (item.dllp_pkt.size() > 2 && item.dllp_pkt[0] == `SDP && item.dllp_pkt[1][31:24] == ACK_DLLP_TYPE &&
-        drv != null && drv.fsm.curr_state == DL_ACTIVE) begin
+        drv != null && drv.fsm.curr_state == DL_ACTIVE &&
+        (max_bad_acks < 0 || n_bad_acks < max_bad_acks)) begin
       item.dllp_pkt[2] = item.dllp_pkt[2] ^ 32'h00FF_0000;   // flip CRC16 bits
-      `uvm_info("DL_INJECT", $sformatf("%s: ACK seq=%0d sent with a bad CRC (will be dropped)",
-                                       dev_name, item.dllp_pkt[1][11:0]), UVM_NONE)
+      n_bad_acks++;
+      `uvm_info("DL_INJECT", $sformatf("%s: ACK seq=%0d sent with a bad CRC (will be dropped) - %0d of %0d",
+                                       dev_name, item.dllp_pkt[1][11:0], n_bad_acks, max_bad_acks), UVM_NONE)
       return 1;
     end
     return 0;
@@ -38,9 +54,14 @@ endclass
 
 class dl_replay_timeout_test extends dl_base_test;
   `uvm_component_utils(dl_replay_timeout_test)
+  int bad_acks = 1;   // ACK DLLPs EP corrupts (see dl_drop_ack_rec)
 
   function new(string name = "dl_replay_timeout_test", uvm_component parent = null);
     super.new(name, parent);
+  endfunction
+
+  function void setup_knobs();
+    dl_drop_ack_rec::max_bad_acks = bad_acks;   // static: set again for every test
   endfunction
 
   function dl_tx_recorder make_recorder(string dev);
@@ -57,6 +78,7 @@ class dl_replay_timeout_test extends dl_base_test;
     catcher.expect_id("REPLAY_TIMER");  // timer expiry warnings, REPLAY_NUM rollover
     catcher.expect_id("LINK_RETRAIN");
     catcher.expect_id("SEQ_CHECK");     // EP sees the replayed TLPs as duplicates
+    catcher.watch_text("REPLAY_NUM=1");  // start_replay(): first replay
   endfunction
 
   function void dl_checks();
@@ -114,8 +136,29 @@ class dl_replay_timeout_test extends dl_base_test;
     if (order_ok) foreach (orig_seq[i]) if (replays[i] != orig_seq[i]) order_ok = 0;
     dl_check(order_ok, "Replay order = oldest unACKed TLP first, all of them",
              $sformatf("expected %p, got %p", orig_seq, replays));
-    dl_check(rc_dl.REPLAY_NUM != 0 || catcher.errors("REPLAY_TIMER") > 0,
-             "REPLAY_NUM incremented on replay", $sformatf("REPLAY_NUM=%0d", rc_dl.REPLAY_NUM));
+    // REPLAY_NUM is reset by the ACK that ends the test, so check the replay log
+    dl_check(catcher.text_hits("REPLAY_NUM=1") >= 1, "REPLAY_NUM incremented on replay",
+             $sformatf("replays with REPLAY_NUM=1: %0d", catcher.text_hits("REPLAY_NUM=1")));
+
+    // Recovery once EP's ACKs get through again
+    begin
+      dl_drop_ack_rec r;
+      bit [11:0] last_sent;
+      last_sent = rc_dl.NEXT_TRANSMIT_SEQ - 12'd1;
+      if ($cast(r, ep_rec))
+        dl_check(dl_drop_ack_rec::max_bad_acks < 0 || r.n_bad_acks == dl_drop_ack_rec::max_bad_acks,
+                 "EP corrupted the configured number of ACKs",
+                 $sformatf("corrupted=%0d max_bad_acks=%0d", r.n_bad_acks, dl_drop_ack_rec::max_bad_acks));
+      dl_check(rc_dl.ACKD_SEQ == last_sent, "RC got an ACK for its last TLP after the lost ACKs",
+               $sformatf("ACKD_SEQ=%0d last seq sent=%0d", rc_dl.ACKD_SEQ, last_sent));
+      dl_check(pcie_dl_seq_item::get_replay_count_static(rc_dl.cfg.device_id) == 0,
+               "RC replay buffer empty at the end (replays stopped)",
+               $sformatf("%0d DW left", pcie_dl_seq_item::get_replay_count_static(rc_dl.cfg.device_id)));
+      dl_check(rc_dl.REPLAY_NUM == 0, "REPLAY_NUM reset to 0 by the forward-progress ACK",
+               $sformatf("REPLAY_NUM=%0d", rc_dl.REPLAY_NUM));
+      dl_check(ep_dl.tl_queue.size() == orig_seq.size(), "EP accepted each RC TLP once (replays dropped as duplicates)",
+               $sformatf("accepted=%0d, RC TLPs=%0d", ep_dl.tl_queue.size(), orig_seq.size()));
+    end
   endfunction
 endclass
 
