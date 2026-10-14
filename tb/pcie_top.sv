@@ -40,6 +40,10 @@ module top;
   initial begin
     $dumpfile("ltssm_waves.vcd");
     $dumpvars(0, top);
+	
+    // vpd waves generation
+    $vcdplusfile("sim_output.vpd");
+    $vcdpluson(0,top);
   end
   initial begin
     uvm_config_db#(virtual dl_if)::set(null, "*", "vif", dl_if_0);
