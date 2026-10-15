@@ -20,6 +20,12 @@ class pcie_dl_cfg extends uvm_object;
   bit rx_fc_auto_update   = 0;   // 1: credits of every TLP passed to the TL are returned with UpdateFC
   int rx_fc_update_cycles = 100; // clocks between freeing credits and sending the UpdateFC
   int rx_fc_refresh_cycles = 1000; // UpdateFC of every credit type is repeated after this many idle clocks
+
+  // Transmit: the driver holds a run-phase objection while TL TLPs wait in its
+  // queue (e.g. for flow-control credits), so a test cannot end with a TLP
+  // still queued. It lets go if no TLP was sent for this many clocks (a TLP
+  // that can never get credits must not hang the test).
+  int tlp_pending_hold_cycles = 20000;
   
   bit is_rc;
   bit is_active;

@@ -296,6 +296,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
       dlcmsm_rx_restartable();   // Main receive path (restarted after a DL_Down)
       dl_link_monitor();         // LinkUp / reset -> DL_Down handling
       rx_fc_updater();           // UpdateFC for credits freed by the receiver
+      tlp_pending_objection(phase); // keep the test alive while TL TLPs wait for credits
       acknak_timer_manager();    // ACK/NAK latency tracking
       handle_acknak_requests();  // ACK/NAK generation and dispatch
       monitor_replay_timer();    // Replay timeout detection and handling
@@ -882,6 +883,7 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
   //--------------------------------------------------------------------------
   task send_dllp(pcie_dl_seq_item req);
     req.device_id = cfg.device_id;
+    rx_fc_own_updatefc(req);
     if (!req.is_tlp && !req.is_nop && !req.is_pm &&
         req.dllps_pkt.dllp_type inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
                                         INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
@@ -1886,6 +1888,32 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
     end
   endfunction
 
+  // With cfg.rx_fc_auto_update = 1 the driver owns CREDITS_ALLOCATED: an
+  // UpdateFC must advertise that value (spec: UpdateFC carries the current
+  // CREDITS_ALLOCATED). An UpdateFC from the DL sequence carries the
+  // sequence's own absolute HdrFC/DataFC, which can be lower than credits
+  // already returned and would pull the partner's credit limit back down
+  // (seen as the last MWr stuck in dl_rx_fc_update_test). The credit fields
+  // of such an UpdateFC are replaced with the driver's values; the
+  // HdrScale/DataScale fields are kept.
+  function void rx_fc_own_updatefc(pcie_dl_seq_item req);
+    int       c;
+    bit [7:0] h;
+    bit [11:0] d;
+    if (!cfg.rx_fc_auto_update || req.is_tlp || req.is_nop || req.is_pm) return;
+    if (!(req.dllps_pkt.dllp_type inside {UPDATEFC_P_VC0, UPDATEFC_NP_VC0, UPDATEFC_CPL_VC0})) return;
+    c = rx_fc_class(req.dllps_pkt.dllp_type);
+    if (!rx_fc_init_seen[c]) return;
+    h = rx_fc_hdr_inf[c]  ? 8'd0  : rx_fc_hdr_alloc[c];
+    d = rx_fc_data_inf[c] ? 12'd0 : rx_fc_data_alloc[c];
+    if (req.dllps_pkt.HdrFC != h || req.dllps_pkt.DataFC != d)
+      `uvm_info(get_type_name(), $sformatf("Device %0d: %s from sequence (HdrFC=%0d DataFC=%0d) sent with CREDITS_ALLOCATED HdrFC=%0d DataFC=%0d",
+                                           cfg.device_id, req.dllps_pkt.dllp_type.name(), req.dllps_pkt.HdrFC,
+                                           req.dllps_pkt.DataFC, h, d), UVM_LOW)
+    req.dllps_pkt.HdrFC  = h;
+    req.dllps_pkt.DataFC = d;
+  endfunction
+
   // Called for every good TLP accepted (hdr0 = first header DW)
   function void rx_fc_on_tlp_received(bit [31:0] hdr0);
     int c, h, d;
@@ -1908,6 +1936,44 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
       if (!(rx_fc_hdr_inf[c] && rx_fc_data_inf[c])) rx_fc_dirty[c] = 1;
     end
   endfunction
+
+  //--------------------------------------------------------------------------
+  // Task: tlp_pending_objection
+  //   The driver only raised an objection while it was driving a TLP. A TL TLP
+  //   waiting in dl_tlp_queue for credits held none, so the test could end
+  //   with it still queued (dl_rx_fc_update_test: 39 of 40 MWr sent).
+  //   Holds one objection while TLPs are queued in DL_ACTIVE. Drops it when
+  //   the queue is empty, the DLCMSM leaves DL_ACTIVE, or no TLP was sent for
+  //   cfg.tlp_pending_hold_cycles clocks (a TLP starved on purpose, e.g.
+  //   dl_fc_gating_test, must not hang the test).
+  //--------------------------------------------------------------------------
+  task tlp_pending_objection(uvm_phase phase);
+    bit        held;
+    int        stall;
+    bit [11:0] last_nts;
+    held     = 0;
+    stall    = 0;
+    last_nts = NEXT_TRANSMIT_SEQ;
+    forever begin
+      @(posedge vif.clk);
+      if (dl_tlp_queue.size() == 0 || NEXT_TRANSMIT_SEQ != last_nts) stall = 0;
+      else if (stall < cfg.tlp_pending_hold_cycles) stall++;
+      last_nts = NEXT_TRANSMIT_SEQ;
+      if (fsm.curr_state == DL_ACTIVE && dl_tlp_queue.size() > 0 && stall < cfg.tlp_pending_hold_cycles) begin
+        if (!held) begin
+          phase.raise_objection(this, "TL TLPs waiting in dl_tlp_queue");
+          held = 1;
+        end
+      end
+      else if (held) begin
+        if (stall >= cfg.tlp_pending_hold_cycles)
+          `uvm_warning(get_type_name(), $sformatf("Device %0d: %0d TLP(s) waiting, none sent for %0d clocks - no longer holding the test",
+                                                  cfg.device_id, dl_tlp_queue.size(), stall))
+        phase.drop_objection(this, "TL TLP queue empty / stalled");
+        held = 0;
+      end
+    end
+  endtask
 
   // Sends an UpdateFC for every credit type whose credits were freed, and
   // repeats the UpdateFC of every type periodically (spec: UpdateFC is also
