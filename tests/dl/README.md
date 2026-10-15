@@ -12,6 +12,7 @@ the point of these tests: each failure is a VIP issue to report.
 | Branch | Owner | Tests |
 |---|---|---|
 | `dl_tests_akash` | Akash Kumar Sahu (M7) | `dl_init_test`, `dl_ack_test`, `dl_lcrc_nak_test`, `dl_lcrc_seq_cover_test` |
+| `dl_tests_akash_sfc_dlf` | Akash Kumar Sahu (M7) | `dl_sfc_both_support_test`, `dl_sfc_rc_only_test`, `dl_dlf_rc_only_test` |
 | `dl_tests_bhabagrahi` | Bhabagrahi Pradhan (M1) | `dl_replay_timeout_test`, `dl_seq_dup_test`, `dl_seq_skip_test`, `dl_nullified_tlp_test` |
 | `dl_tests_mayank` | Kumar Mayank Kashyap (M2) | `dl_dllp_crc_test`, `dl_fc_gating_test`, `dl_state_filter_test`, `dl_fsm_per_device_test` |
 
@@ -53,6 +54,9 @@ To see every packet each DL sent, look for the `---- packets sent by RC DL` and
 | `dl_fc_gating_test` | Flow-control gating | EP gives 1 Posted header credit, RC sends 3 MWr | RC never sends a Posted TLP without a credit |
 | `dl_state_filter_test` | DLLP rules per DLCMSM state | RC offers PM_Enter_L1 in FC_INIT1 and in DL_ACTIVE | blocked in FC_INIT1, sent and received in DL_ACTIVE |
 | `dl_fsm_per_device_test` | Separate DLCMSM per device | all EP InitFC DLLPs get a bad CRC | RC stays in FC_INIT1, never sends InitFC2, never reaches DL_ACTIVE |
+| `dl_sfc_both_support_test` | Scaled Flow Control | nothing (RC scale x16/x4, EP x4/x16) | SFC active on both; credit limits = HdrFC/DataFC x scale; same non-zero scale in every InitFC/UpdateFC (also driver-generated); DLF Status = partner's features |
+| `dl_sfc_rc_only_test` | Scaled Flow Control negotiation | RC sends scale 11 although EP has no SFC (`+DL_SFC_RC_INJECT=0` to turn off) | SFC not active; EP ignores the scale fields; raw credit limits; EP sends 00 |
+| `dl_dlf_rc_only_test` | DL Feature exchange, partner without DLF | nothing (EP has DLF Exchange Enable = 0) | RC leaves DL_FEATURE on InitFC1; EP never enters it; both DL_ACTIVE; Remote Valid = 0 in cfg and DLF Status reg on both; SFC not active |
 
 Every test also checks, for RC and EP: DLCMSM reached DL_ACTIVE (except
 `dl_fsm_per_device_test`), and NEXT_RCV_SEQ = number of TLPs accepted.
