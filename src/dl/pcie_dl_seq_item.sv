@@ -439,6 +439,39 @@ class pcie_dl_seq_item extends uvm_sequence_item;
     return ~crc;
   endfunction
 
+  // LCRC over a byte stream: same CRC and bit order as calculate_lcrc()
+  // (bytes in order, each byte LSB first, CRC complemented at the end).
+  function bit [31:0] calculate_lcrc_bytes(input bit [7:0] data_bytes[$]);
+    bit [31:0] crc = 32'hFFFF_FFFF;
+    bit [31:0] poly = 32'h04C11DB7;
+    bit crc_msb;
+    foreach (data_bytes[i]) begin
+      for (int k = 0; k < 8; k++) begin
+        crc_msb = crc[31];
+        crc = {crc[30:0], 1'b0};
+        if (crc_msb ^ data_bytes[i][k])
+          crc ^= poly;
+      end
+    end
+    return ~crc;
+  endfunction
+
+  // LCRC of a TLP (spec 3.6.2.1): covers the 16-bit Sequence Number field
+  // ({4'b0000 reserved, seq[11:0]}, upper byte first) followed by the TLP
+  // (header, payload, ECRC). data_words = TLP DWORDs without seq DW and LCRC.
+  function bit [31:0] calculate_tlp_lcrc(input bit [11:0] seq, input bit [31:0] data_words[$]);
+    bit [7:0] b[$];
+    b.push_back({4'b0000, seq[11:8]});
+    b.push_back(seq[7:0]);
+    foreach (data_words[i]) begin
+      b.push_back(data_words[i][31:24]);
+      b.push_back(data_words[i][23:16]);
+      b.push_back(data_words[i][15:8]);
+      b.push_back(data_words[i][7:0]);
+    end
+    return calculate_lcrc_bytes(b);
+  endfunction
+
   // LCRC Calculator
   //   function bit [31:0] calculate_lcrc(input bit [31:0] data_words[$]);
   //     bit [31:0] crc = 32'hFFFF_FFFF;
@@ -591,7 +624,8 @@ class pcie_dl_seq_item extends uvm_sequence_item;
         dllp_pkt.push_back(tx_buffer[i]);
         lcrc_calc_data.push_back(tx_buffer[i]);
       end
-      lcrc = calculate_lcrc(lcrc_calc_data);
+      // LCRC covers the sequence number and the TLP
+      lcrc = calculate_tlp_lcrc(seq_num, lcrc_calc_data);
       dllp_pkt.push_back(lcrc);
     end
   endfunction

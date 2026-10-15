@@ -135,9 +135,9 @@ class dl_dup_seq_rec extends dl_tx_recorder;
     bit [31:0] words[$];
     if (item.dllp_pkt.size() > 2 && item.dllp_pkt[0] == `STP && n_tlp_seen == 1) begin
       item.dllp_pkt[1] = {12'd0, item.dllp_pkt[1][19:0]};
-      // keep the LCRC valid for the VIP's LCRC (header .. payload)
+      // keep the LCRC valid: it covers the (new) sequence number and the TLP
       for (int i = 2; i < item.dllp_pkt.size() - 1; i++) words.push_back(item.dllp_pkt[i]);
-      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_lcrc(words);
+      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_tlp_lcrc(12'd0, words);
       `uvm_info("DL_INJECT", $sformatf("%s: second TLP sent with sequence number 0 (duplicate)", dev_name), UVM_NONE)
       return 1;
     end
@@ -168,18 +168,32 @@ class dl_seq_dup_test extends dl_base_test;
     catcher.watch_text("Duplicate TLP detected");
   endfunction
 
+  // First ACK EP sent in DL_ACTIVE at or after time t (null if none)
+  function dl_tx_record first_ack_after(time t);
+    foreach (ep_rec.recs[i])
+      if (!ep_rec.recs[i].is_tlp && ep_rec.recs[i].dllp_type == ACK_DLLP_TYPE &&
+          ep_rec.recs[i].state == "DL_ACTIVE" && ep_rec.recs[i].t >= t)
+        return ep_rec.recs[i];
+    return null;
+  endfunction
+
   function void dl_checks();
     dl_tx_record ack;
+    time         dup_t;
     dl_check(catcher.text_hits("Duplicate TLP detected") >= 1, "EP detected the duplicate TLP",
              $sformatf("hits=%0d", catcher.text_hits("Duplicate TLP detected")));
     dl_check(ep_dl.tl_queue.size() <= rc_dl.NEXT_TRANSMIT_SEQ, "EP did not pass the duplicate to the TL",
              $sformatf("EP accepted=%0d, RC TLPs=%0d", ep_dl.tl_queue.size(), rc_dl.NEXT_TRANSMIT_SEQ));
-    dl_check(ep_rec.count_dllp(ACK_DLLP_TYPE, "DL_ACTIVE") >= 1, "EP sent an ACK after the duplicate",
-             $sformatf("ACKs sent=%0d", ep_rec.count_dllp(ACK_DLLP_TYPE, "DL_ACTIVE")));
-    ack = ep_rec.last_dllp(ACK_DLLP_TYPE);
-    if (ack != null && ack.state == "DL_ACTIVE")
+    // The ACK that answers the duplicate is the first one EP sends after
+    // detecting it. The LAST ACK of the test is not: RC's real seq 1 is never
+    // delivered, REPLAY_TIMER expires, RC replays it and EP then ACKs seq 1.
+    dup_t = catcher.first_hit("Duplicate TLP detected");
+    ack   = first_ack_after(dup_t);
+    dl_check(ack != null, "EP sent an ACK after the duplicate",
+             $sformatf("duplicate detected @%0t, ACKs sent in DL_ACTIVE=%0d", dup_t, ep_rec.count_dllp(ACK_DLLP_TYPE, "DL_ACTIVE")));
+    if (ack != null)
       dl_check(ack.acknak_seq == 0, "ACK carries the last good sequence number (0)",
-               $sformatf("AckNak_Seq_Num=%0d", ack.acknak_seq));
+               $sformatf("first ACK after the duplicate @%0t: AckNak_Seq_Num=%0d", ack.t, ack.acknak_seq));
   endfunction
 endclass
 
@@ -199,8 +213,9 @@ class dl_skip_seq_rec extends dl_tx_recorder;
     bit [31:0] words[$];
     if (item.dllp_pkt.size() > 2 && item.dllp_pkt[0] == `STP && n_tlp_seen == 0) begin
       item.dllp_pkt[1] = {12'd2, item.dllp_pkt[1][19:0]};
+      // keep the LCRC valid: it covers the (new) sequence number and the TLP
       for (int i = 2; i < item.dllp_pkt.size() - 1; i++) words.push_back(item.dllp_pkt[i]);
-      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_lcrc(words);
+      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_tlp_lcrc(12'd2, words);
       `uvm_info("DL_INJECT", $sformatf("%s: first TLP sent with sequence number 2 (0 and 1 skipped)", dev_name), UVM_NONE)
       return 1;
     end
