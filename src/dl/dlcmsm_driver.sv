@@ -1333,7 +1333,8 @@ class dlcmsm_driver extends uvm_driver #(pcie_dl_seq_item);
           rx_tlp_item.tlp_pkt = dl_frm_pl_q[1:$];
           rx_tlp_item.is_tlp = 1;
           rx_tlp_item.do_unpack_bytes();
-          computed_lcrc = rx_tlp_item.calculate_lcrc(dl_frm_pl_q[2:dl_frm_pl_q.size()-2]);
+          // LCRC covers the received sequence number and the TLP
+          computed_lcrc = rx_tlp_item.calculate_tlp_lcrc(sq_n, dl_frm_pl_q[2:dl_frm_pl_q.size()-2]);
           received_lcrc = rx_lcrc;
 //           $display("989898988989898989898989989898989898");
 

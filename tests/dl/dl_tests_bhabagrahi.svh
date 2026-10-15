@@ -135,9 +135,9 @@ class dl_dup_seq_rec extends dl_tx_recorder;
     bit [31:0] words[$];
     if (item.dllp_pkt.size() > 2 && item.dllp_pkt[0] == `STP && n_tlp_seen == 1) begin
       item.dllp_pkt[1] = {12'd0, item.dllp_pkt[1][19:0]};
-      // keep the LCRC valid for the VIP's LCRC (header .. payload)
+      // keep the LCRC valid: it covers the (new) sequence number and the TLP
       for (int i = 2; i < item.dllp_pkt.size() - 1; i++) words.push_back(item.dllp_pkt[i]);
-      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_lcrc(words);
+      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_tlp_lcrc(12'd0, words);
       `uvm_info("DL_INJECT", $sformatf("%s: second TLP sent with sequence number 0 (duplicate)", dev_name), UVM_NONE)
       return 1;
     end
@@ -199,8 +199,9 @@ class dl_skip_seq_rec extends dl_tx_recorder;
     bit [31:0] words[$];
     if (item.dllp_pkt.size() > 2 && item.dllp_pkt[0] == `STP && n_tlp_seen == 0) begin
       item.dllp_pkt[1] = {12'd2, item.dllp_pkt[1][19:0]};
+      // keep the LCRC valid: it covers the (new) sequence number and the TLP
       for (int i = 2; i < item.dllp_pkt.size() - 1; i++) words.push_back(item.dllp_pkt[i]);
-      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_lcrc(words);
+      item.dllp_pkt[item.dllp_pkt.size()-1] = item.calculate_tlp_lcrc(12'd2, words);
       `uvm_info("DL_INJECT", $sformatf("%s: first TLP sent with sequence number 2 (0 and 1 skipped)", dev_name), UVM_NONE)
       return 1;
     end
