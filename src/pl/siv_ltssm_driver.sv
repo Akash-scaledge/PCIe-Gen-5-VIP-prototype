@@ -12,21 +12,50 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
   uvm_blocking_get_port #(dw_pkt) pl_rcv_dl_port;
 
   global_que_t  pkt_from_dl;
-  global_que_t  pkt_from_dl_stored[$];
   global_que_t pkt_2_dl;
 
   // Temporary variables
   bit [7:0]                  current_link_num;
   bit [7:0]                  current_lane_num;
   string                     temp_ts;
+  // semaphore to arbitrate betweenb ordered setand tlp/dllp
+  semaphore 		tx_lock	= new(1);
 
-  //   byte max_data_rate;
-  //   bit  speed_change;
-  //   byte adv_data_rate;
+  bit rx_resync;   // set on a framing error, cleared on the next IDL
 
+  // adding instance of tokens so rc and ep driver has their own copy
+STP_TOKEN STP; 
+SDP_TOKEN SDP; 
+EDS_TOKEN EDS; 
+EDB_TOKEN EDB; 
+IDL_TOKEN IDL; 
   // Constructor
   function new(string name, uvm_component parent);
     super.new(name, parent);
+  endfunction
+
+
+
+
+  // returns {FP, FCRC[3:0]} for an STP Length (spec Gen3+ framing token) 
+  function automatic bit [4:0] stp_fp_fcrc(bit [10:0] L); 
+    bit [3:0] c; 
+    c[0] = L[10]^L[7]^L[6]^L[4]^L[2]^L[1]^L[0]; 
+    c[1] = L[10]^L[9]^L[7]^L[5]^L[4]^L[3]^L[2]; 
+    c[2] = L[9]^L[8]^L[6]^L[4]^L[3]^L[2]^L[1]; 
+    c[3] = L[8]^L[7]^L[5]^L[3]^L[2]^L[1]^L[0]; 
+    return {^{L, c}, c}; 
+  endfunction
+  
+  task automatic next_byte(output logic [7:0] b); 
+    @(posedge pl_intf.clk); 
+    b = pl_intf.rx_data; 
+  endtask 
+   
+  function void framing_err(string msg); 
+    `uvm_error("PL_FRAMING", $sformatf("[%s] %s", pl_cfg.inst_name, msg)) 
+    rx_resync = 1; 
+    // TODO: request RECOVERY_RCVRLOCK from state_machine (spec 4.2.2.3.3) 
   endfunction
 
 
@@ -49,12 +78,15 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
     len={STP.len1,STP.len};
     $display("loccaaal packet len = %0d",len);
 
-    STP.FCRC[0] = len[10] ^ len[7] ^ len[6] ^ len[4] ^ len[2] ^ len[1] ^ len[0]; 
-    STP.FCRC[1] = len[10] ^ len[9] ^ len[7] ^ len[5] ^ len[4] ^ len[3] ^ len[2]; 
-    STP.FCRC[2] = len[9] ^ len[8] ^ len[6] ^ len[4] ^ len[3] ^ len[2] ^ len[1]; 
-    STP.FCRC[3] = len[8] ^ len[7] ^ len[5] ^ len[3] ^ len[2] ^ len[1] ^ len[0]; 
+    //STP.FCRC[0] = len[10] ^ len[7] ^ len[6] ^ len[4] ^ len[2] ^ len[1] ^ len[0]; 
+    //STP.FCRC[1] = len[10] ^ len[9] ^ len[7] ^ len[5] ^ len[4] ^ len[3] ^ len[2]; 
+    //STP.FCRC[2] = len[9] ^ len[8] ^ len[6] ^ len[4] ^ len[3] ^ len[2] ^ len[1]; 
+    //STP.FCRC[3] = len[8] ^ len[7] ^ len[5] ^ len[3] ^ len[2] ^ len[1] ^ len[0]; 
+    //STP.FP = len[10] ^ len[9] ^ len[8] ^ len[7] ^ len[6] ^ len[5] ^ len[4] ^ len[3] ^ len[2] ^ len[1] ^ len[0] ^ crc[3] ^ crc[2] ^ crc[1] ^ crc[0];
+
+    // replacing FCRC/FP logic to use the same logic from stp_fp_fcrc() so that tx and rx use the same logic
+   {STP.FP, STP.FCRC} = stp_fp_fcrc(len);
     crc=STP.FCRC;
-    STP.FP = len[10] ^ len[9] ^ len[8] ^ len[7] ^ len[6] ^ len[5] ^ len[4] ^ len[3] ^ len[2] ^ len[1] ^ len[0] ^ crc[3] ^ crc[2] ^ crc[1] ^ crc[0];
     STP.fixed1 = 4'b1111;
     //EDS
     EDS.fixed = 4'b0001;
@@ -155,6 +187,9 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
       // Drive raw byte
       pl_intf.tx_data <= local_pkt[i];
     end
+    //	forcing tx_data to 00 IDL
+    @(posedge pl_intf.clk);
+    pl_intf.tx_data	<= 8'h00;
   endtask
 
 
@@ -227,43 +262,21 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
 // Task to collect Packets from DL layer
 //--------------------------------------
   task collect_from_dl();
-    forever begin
-//       pl_rcv_dl_port.get(pkt_from_dl);
-      dw_pkt::get_q(pl_rcv_dl_port, pkt_from_dl);
-      pkt_from_dl_stored.push_back(pkt_from_dl);
-      `uvm_info("PL_RCV_DL_PKT",$sformatf("RECIEVED SUCCESS PKT:/n %p",pkt_from_dl_stored),UVM_LOW)
-
-
-
-
-      //--------------------------------------
-      // L0 DATA TRANSMISSION
-      //--------------------------------------
-      if ((ltssm_rc_state == L0)&& ((pkt_from_dl_stored.size()) != 0)) begin
-        //         logic to convert 32 bit Queue to 8 bit queue
-        byte pkt[$];
-        pkt_layer_e layer;
-        global_que_t temp_q;
-        int m;
-
-        temp_q=pkt_from_dl_stored.pop_front();
-        if(temp_q[0] == `SDP)begin
-          layer =  PKT_DLLP;
-//           $display("*********************************PKT_DLLP*******************************************");
-        end
-        else  begin
-          layer = PKT_TLP ;
-//           $display("*********************************PKT_TLP******************************************");
-        end
-        temp_q.pop_front;
-        pl_byte_converter(temp_q,pkt);
-        unpack_add(pkt);
-        drive_raw_bytes_with_tokens(pkt,layer);
-
-
-        continue;
-      end
-    end
+	  global_que_t 		temp_q;
+	  byte 			pkt[$];
+	  pkt_layer_e		layer;
+    	forever begin
+    	  dw_pkt::get_q(pl_rcv_dl_port, temp_q);
+    	  wait( state_machine.current_state == L0);
+    	  layer = (temp_q[0] == `SDP)? PKT_DLLP: PKT_TLP;	// decide between dllp and tlp
+    	  void'(temp_q.pop_front());				// remove the dllp/tlp identifier
+    	  pl_byte_converter(temp_q,pkt);
+    	  unpack_add(pkt);
+    	  tx_lock.get(1);
+    	  drive_raw_bytes_with_tokens(pkt,layer);
+    	  tx_lock.put(1);
+    	  pkt.delete();
+    	end
   endtask
 
 
@@ -278,13 +291,6 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
       wait (state_machine.current_state != DETECT_QUIET && 
             state_machine.current_state != DETECT_ACTIVE && 
             state_machine.current_state != RECOVERY_SPEED);
-
-
-
-
-
-
-
 
 
       case (state_machine.current_state)
@@ -310,7 +316,9 @@ class siv_ltssm_driver extends uvm_driver #(siv_ltssm_seq_item);
         RECOVERY_IDLE: begin
           seq_item_port.get_next_item(req);
           `uvm_do_callbacks(siv_ltssm_driver,siv_ltssm_ts_pkt_modify_callback,modify_item(req));
+	  tx_lock.get(1);	// using semaphore for arbitration
           drive_seq(req);
+	  tx_lock.put(1);
           seq_item_port.item_done();
         end
 
@@ -758,128 +766,185 @@ endtask
 
 
 //Task to perform Byte stripping
-
   task pl_byte_converter(input global_que_t p_in, output byte p_out[$] );
-    begin
+	  p_out.delete();
+	  foreach(p_in[i]) begin
+		  for(int j=0; j<4; j++) 
+			  p_out.push_back(byte'(p_in[i][8*j +: 8]));
+	  end
 
-      typedef bit[31:0] loc1[$];
-      int k;
-      byte l;
-      loc1 loc;
+      /* OLD CODE
+      	typedef bit[31:0] loc1[$];
+      	int k;
+      	byte l;
+      	loc1 loc;
 
-      loc=loc1'(p_in);
-      foreach(p_in[i]) begin
-        $display("pkt[%0d]=%h",i,loc[i]);
-        for(int j=0;j<=3;j++) begin 
-          l=byte'(loc[i][k+:8]);
-          p_out[4*i+j]= l;
-          k+=8;
-        end
-        k=0;
-      end
-    end    
+      	loc=loc1'(p_in);
+      	foreach(p_in[i]) begin
+      	  $display("pkt[%0d]=%h",i,loc[i]);
+      	  for(int j=0;j<=3;j++) begin 
+      	    l=byte'(loc[i][k+:8]);
+      	    p_out[4*i+j]= l;
+      	    k+=8;
+      	  end
+      	  k=0;
+      	end 
+      */
   endtask
   
   
-  task valid_data_rx();
-    byte temp_que[$],temp_que1[$];
-    int len_tlp;
-    global_que_t gbl;
-    forever begin
-      @(posedge pl_intf.clk);
-      if (state_machine.current_state == L0) begin
+  //task valid_data_rx();
+  //  byte temp_que[$],temp_que1[$];
+  //  int len_tlp;
+  //  global_que_t gbl;
+  //  forever begin
+  //    @(posedge pl_intf.clk);
+  //    if (state_machine.current_state == L0) begin
 
-        if (pl_intf.rx_data == 8'b11110000) begin
-          temp_que.push_back(pl_intf.rx_data);
-//           $display("UUUUUUUUUUUUUUUUUUUU");
-          repeat (7) begin
-            @(posedge pl_intf.clk);
-            temp_que.push_back(pl_intf.rx_data);
-          end
-        end
-        else if ( pl_intf.rx_data[3:0] == 4'b1111) begin
-//           $display("YYYYYYYYYYYYYYYYYYYYYY");
-          temp_que.push_back(pl_intf.rx_data);
-          repeat (3) begin
-            @(posedge pl_intf.clk);
-            temp_que.push_back(pl_intf.rx_data);
-            `uvm_info("Data buffer",$sformatf(" que %p",temp_que),UVM_NONE)
-          end
-          `uvm_info("Data buffer",
-                    $sformatf(" len %0d",{temp_que[1][6:0],temp_que[0][7:4]}),
-                    UVM_NONE)
-          len_tlp = {temp_que[1][6:0],temp_que[0][7:4]};
+  //      if (pl_intf.rx_data == 8'b11110000) begin
+  //        temp_que.push_back(pl_intf.rx_data);
+////           $display("UUUUUUUUUUUUUUUUUUUU");
+  //        repeat (7) begin
+  //          @(posedge pl_intf.clk);
+  //          temp_que.push_back(pl_intf.rx_data);
+  //        end
+  //      end
+  //      else if ( pl_intf.rx_data[3:0] == 4'b1111) begin
+////           $display("YYYYYYYYYYYYYYYYYYYYYY");
+  //        temp_que.push_back(pl_intf.rx_data);
+  //        repeat (3) begin
+  //          @(posedge pl_intf.clk);
+  //          temp_que.push_back(pl_intf.rx_data);
+  //          `uvm_info("Data buffer",$sformatf(" que %p",temp_que),UVM_NONE)
+  //        end
+  //        `uvm_info("Data buffer",
+  //                  $sformatf(" len %0d",{temp_que[1][6:0],temp_que[0][7:4]}),
+  //                  UVM_NONE)
+  //        len_tlp = {temp_que[1][6:0],temp_que[0][7:4]};
 
-          repeat (({temp_que[1][6:0],temp_que[0][7:4]}) * 4) begin
-            @(posedge pl_intf.clk);
-            temp_que.push_back(pl_intf.rx_data);
-//             `uvm_info("Data buffer",$sformatf(" que %p",temp_que),UVM_NONE)
-          end
-//           `uvm_info("Data buffer",$sformatf(" que %p",temp_que),UVM_NONE)
-        end
+  //        repeat (({temp_que[1][6:0],temp_que[0][7:4]}) * 4) begin
+  //          @(posedge pl_intf.clk);
+  //          temp_que.push_back(pl_intf.rx_data);
+////             `uvm_info("Data buffer",$sformatf(" que %p",temp_que),UVM_NONE)
+  //        end
+////           `uvm_info("Data buffer",$sformatf(" que %p",temp_que),UVM_NONE)
+  //      end
 
-        if (temp_que[0] == 8'b11110000 && temp_que.size() == 8) begin
-          `uvm_info("Data buffer",
-                    $sformatf(" que before SDP removal %p",temp_que),
-                    UVM_NONE)
-          repeat (2)
-            temp_que.pop_front();
-          repeat (2)
-            temp_que.push_back({0});
-          
-          temp_que[6]=temp_que[4];
-          temp_que[7]=temp_que[5];
+  //      if (temp_que[0] == 8'b11110000 && temp_que.size() == 8) begin
+  //        `uvm_info("Data buffer",
+  //                  $sformatf(" que before SDP removal %p",temp_que),
+  //                  UVM_NONE)
+  //        repeat (2)
+  //          temp_que.pop_front();
+  //        repeat (2)
+  //          temp_que.push_back({0});
+  //        
+  //        temp_que[6]=temp_que[4];
+  //        temp_que[7]=temp_que[5];
 
-          temp_que[4]={0};
-          temp_que[5]={0};
-          
-          `uvm_info("Data buffer",
-                    $sformatf(" que after SDP removal %p",temp_que),
-                    UVM_NONE)
-          for(int i=0; i < 2; i++)
-            begin
-              temp_que1=temp_que[(4*i)+:4];
-              gbl[i]={temp_que1[3],temp_que1[2],temp_que1[1],temp_que1[0]};
-            end
-          gbl.push_front(`SDP);//deadbef
-          `uvm_info("Data buffer",
-                    $sformatf(" 32 bit dllp que sendig to dl  %p",gbl),
-                    UVM_NONE)
-          
-//           pl_sending_dl_port.put(gbl);
-          dw_pkt::put_q(pl_sending_dl_port, gbl);
-          gbl.delete();
-          temp_que.delete();
-        end
-        else if (temp_que.size() ==
-                 (({temp_que[1][6:0],temp_que[0][7:4]}) * 4) + 4) begin
-          `uvm_info("Data buffer",
-                    $sformatf(" que before STP removal %p",temp_que),
-                    UVM_NONE)
-          repeat (4)
-            temp_que.pop_front();
-          `uvm_info("Data buffer",
-                    $sformatf(" que after STP removal %p",temp_que),
-                    UVM_NONE)
-          for(int i=0; i < (len_tlp); i++)
-            begin
-              temp_que1=temp_que[(4*i)+:4];
-              gbl[i]={temp_que1[3],temp_que1[2],temp_que1[1],temp_que1[0]};
-            end
-          gbl.push_front(`STP);//deadbef
-          `uvm_info("Data buffer",
-                    $sformatf(" 32 bit Tlp que sendig to dl  %p",gbl),
-                    UVM_NONE)
-          
-//           pl_sending_dl_port.put(gbl);
-          dw_pkt::put_q(pl_sending_dl_port, gbl);
-          gbl.delete();
-          temp_que.delete();
-        end
+  //        temp_que[4]={0};
+  //        temp_que[5]={0};
+  //        
+  //        `uvm_info("Data buffer",
+  //                  $sformatf(" que after SDP removal %p",temp_que),
+  //                  UVM_NONE)
+  //        for(int i=0; i < 2; i++)
+  //          begin
+  //            temp_que1=temp_que[(4*i)+:4];
+  //            gbl[i]={temp_que1[3],temp_que1[2],temp_que1[1],temp_que1[0]};
+  //          end
+  //        gbl.push_front(`SDP);//deadbef
+  //        `uvm_info("Data buffer",
+  //                  $sformatf(" 32 bit dllp que sendig to dl  %p",gbl),
+  //                  UVM_NONE)
+  //        
+////           pl_sending_dl_port.put(gbl);
+  //        dw_pkt::put_q(pl_sending_dl_port, gbl);
+  //        gbl.delete();
+  //        temp_que.delete();
+  //      end
+  //      else if (temp_que.size() ==
+  //               (({temp_que[1][6:0],temp_que[0][7:4]}) * 4) + 4) begin
+  //        `uvm_info("Data buffer",
+  //                  $sformatf(" que before STP removal %p",temp_que),
+  //                  UVM_NONE)
+  //        repeat (4)
+  //          temp_que.pop_front();
+  //        `uvm_info("Data buffer",
+  //                  $sformatf(" que after STP removal %p",temp_que),
+  //                  UVM_NONE)
+  //        for(int i=0; i < (len_tlp); i++)
+  //          begin
+  //            temp_que1=temp_que[(4*i)+:4];
+  //            gbl[i]={temp_que1[3],temp_que1[2],temp_que1[1],temp_que1[0]};
+  //          end
+  //        gbl.push_front(`STP);//deadbef
+  //        `uvm_info("Data buffer",
+  //                  $sformatf(" 32 bit Tlp que sendig to dl  %p",gbl),
+  //                  UVM_NONE)
+  //        
+////           pl_sending_dl_port.put(gbl);
+  //        dw_pkt::put_q(pl_sending_dl_port, gbl);
+  //        gbl.delete();
+  //        temp_que.delete();
+  //      end
 
-      end
-    end
-  endtask
+  //    end
+  //  end
+  //endtask
+
+	task valid_data_rx(); 
+	  logic [7:0]  b, t1, t2, t3; 
+	  bit   [7:0]  q[$]; 
+	  bit   [10:0] len; 
+	  bit   [4:0]  chk; 
+	  global_que_t gbl; 
+	  forever begin 
+	    @(posedge pl_intf.clk); 
+	    if (state_machine.current_state != L0) continue; 
+	    b = pl_intf.rx_data; 
+	    if ($isunknown(b)) continue;                          // undriven 
+	    if (b == 8'h00) begin rx_resync = 0; continue; end    // IDL 
+	    if (rx_resync) continue;                              // discard until next IDL 
+	 
+	    q.delete(); gbl.delete(); 
+	 
+	    if (b == 8'hF0) begin                                  // ---- SDP + DLLP 
+	      next_byte(t1); 
+	      if (t1 !== 8'hAC) begin 
+	        framing_err($sformatf("SDP 2nd symbol %02h, expected AC", t1)); continue; 
+	      end 
+	      repeat (6) begin next_byte(b); q.push_back(b); end 
+	      gbl.push_back(`SDP); 
+	      gbl.push_back({q[3], q[2], q[1], q[0]}); 
+	      gbl.push_back({q[5], q[4], 16'h0000}); 
+	      dw_pkt::put_q(pl_sending_dl_port, gbl);
+	    end 
+	    else if (b[3:0] == 4'hF) begin                         // ---- STP + TLP 
+	      next_byte(t1); next_byte(t2); next_byte(t3); 
+	      len = {t1[6:0], b[7:4]}; 
+	      chk = stp_fp_fcrc(len); 
+	      if (t2[7:4] !== chk[3:0] || t1[7] !== chk[4]) begin 
+	        framing_err($sformatf("STP FCRC/FP fail: len=%0d FCRC=%h exp=%h FP=%b exp=%b", 
+	                              len, t2[7:4], chk[3:0], t1[7], chk[4])); 
+	        continue; 
+	      end 
+	      if (len < 5) begin 
+	        framing_err($sformatf("STP Length %0d < 5 DW", len)); continue; 
+	      end 
+	      repeat (len*4) begin next_byte(b); q.push_back(b); end 
+	      gbl.push_back(`STP); 
+	      for (int i = 0; i < len; i++) 
+	        gbl.push_back({q[4*i+3], q[4*i+2], q[4*i+1], q[4*i]}); 
+	      dw_pkt::put_q(pl_sending_dl_port, gbl);
+	    end 
+	    else 
+	      framing_err($sformatf("symbol %02h where a framing token was expected", b)); 
+	  end 
+	endtask 
+
+
+
 endclass
 
 //--------------------------------------------------------------
