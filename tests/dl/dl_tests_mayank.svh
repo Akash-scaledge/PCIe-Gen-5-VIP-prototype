@@ -191,30 +191,60 @@ endclass
 //   must not send InitFC2, and must not reach DL_ACTIVE. Each device has its
 //   own DLCMSM, so EP progressing must not move RC.
 //------------------------------------------------------------------------------
+class dl_no_tl_seq extends mem_wr_rd_seq;
+  `uvm_object_utils(dl_no_tl_seq)
+  function new(string name = "dl_no_tl_seq");
+    super.new(name);
+  endfunction
+  task body();
+  endtask
+endclass
+
 class dl_bad_initfc1_rec extends dl_tx_recorder;
   `uvm_object_utils(dl_bad_initfc1_rec)
+	  static int err_count;
   function new(string name = "dl_bad_initfc1_rec");
     super.new(name);
   endfunction
   function bit inject(ref pcie_dl_seq_item item);
-    if (item.dllp_pkt.size() > 2 && item.dllp_pkt[0] == `SDP &&
-        item.dllp_pkt[1][31:24] inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
-                                        INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
+    if (item.dllp_pkt.size() > 2 && item.dllp_pkt[0] == `SDP && err_count<=10000 &&
+	item.dllp_pkt[1][31:24] inside {INITFC1_P_VC0, INITFC1_NP_VC0, INITFC1_CPL_VC0,
+					INITFC2_P_VC0, INITFC2_NP_VC0, INITFC2_CPL_VC0}) begin
+					err_count++;
       item.dllp_pkt[2] = item.dllp_pkt[2] ^ 32'h00F0_0000;   // flip CRC16 bits
       `uvm_info("DL_INJECT", $sformatf("%s: InitFC DLLP type %h sent with a bad CRC", dev_name, item.dllp_pkt[1][31:24]), UVM_NONE)
       return 1;
     end
+    err_count++;
     return 0;
   endfunction
 endclass
 
 class dl_fsm_per_device_test extends dl_base_test;
   `uvm_component_utils(dl_fsm_per_device_test)
-
   function new(string name = "dl_fsm_per_device_test", uvm_component parent = null);
     super.new(name, parent);
     expect_link_active = 0;   // the link must NOT come up in this test
   endfunction
+
+  function void setup_knobs();
+    set_type_override_by_type(mem_wr_rd_seq::get_type(), dl_no_tl_seq::get_type());
+  endfunction
+
+  task observe(uvm_phase phase);
+    phase.raise_objection(this);
+    wait(dl_bad_initfc1_rec::err_count>500);	
+    $display("############################################################################################################");
+    phase.drop_objection(this);
+    phase.drop_objection(this);
+  endtask
+
+  task run_phase(uvm_phase phase);
+    fork
+      observe(phase);
+    join_none
+    super.run_phase(phase);
+  endtask
 
   function dl_tx_recorder make_recorder(string dev);
     dl_bad_initfc1_rec r;
@@ -234,12 +264,19 @@ class dl_fsm_per_device_test extends dl_base_test;
     int n_init2;
     n_init2 = rc_rec.count_dllp(INITFC2_P_VC0) + rc_rec.count_dllp(INITFC2_NP_VC0) + rc_rec.count_dllp(INITFC2_CPL_VC0);
     dl_check(catcher.errors("DLLP_CRC") >= 1, "RC detected EP's bad InitFC DLLPs",
-             $sformatf("DLLP_CRC errors=%0d", catcher.errors("DLLP_CRC")));
+	     $sformatf("DLLP_CRC errors=%0d", catcher.errors("DLLP_CRC")));
     dl_check(rc_dl.tx_ph_limit == 0, "RC has no Posted credits from EP (all InitFC dropped)",
-             $sformatf("tx_ph_limit=%0d", rc_dl.tx_ph_limit));
+	     $sformatf("tx_ph_limit=%0d", rc_dl.tx_ph_limit));
     dl_check(n_init2 == 0, "RC never sent InitFC2 (it never completed FC_INIT1)",
-             $sformatf("InitFC2 DLLPs sent by RC=%0d", n_init2));
+	     $sformatf("InitFC2 DLLPs sent by RC=%0d", n_init2));
     dl_check(rc_dl.fsm.curr_state != DL_ACTIVE, "RC did not reach DL_ACTIVE",
-             $sformatf("RC state=%s (EP state=%s)", rc_dl.fsm.curr_state.name(), ep_dl.fsm.curr_state.name()));
+	     $sformatf("RC state=%s (EP state=%s)", rc_dl.fsm.curr_state.name(), ep_dl.fsm.curr_state.name()));
+    dl_check(rc_dl.fsm.curr_state == FC_INIT1, "RC stayed in FC_INIT1",
+	     $sformatf("RC state=%s", rc_dl.fsm.curr_state.name()));
+    dl_check(rc_rec.count_dllp(INITFC1_P_VC0) >= 2, "RC kept repeating InitFC1 while waiting in FC_INIT1",
+	     $sformatf("InitFC1_P sent by RC=%0d", rc_rec.count_dllp(INITFC1_P_VC0)));
+    dl_check(ep_rec.count_dllp(INITFC2_P_VC0) >= 2, "EP kept repeating InitFC2 while waiting in FC_INIT2",
+	     $sformatf("InitFC2_P sent by EP=%0d", ep_rec.count_dllp(INITFC2_P_VC0)));
   endfunction
 endclass
+

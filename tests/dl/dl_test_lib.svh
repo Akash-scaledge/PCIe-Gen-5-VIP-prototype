@@ -347,19 +347,33 @@ class dl_multi_mwr_seq extends mem_wr_rd_seq;
     super.new(name);
   endfunction
 
+  // MPS: siv_pcie_tl_sequence_items::post_randomize() builds TLP_m only if
+  // MPS == 0 or len <= MPS, and gives no error otherwise. Its MPS constraint
+  // (MPS == 128) is commented out, so MPS is a free 10-bit random value: an
+  // MWr that draws MPS = 1 or 2 (len = 3) went to the DL as an EMPTY packet,
+  // the DL dropped it ("TLP from TL has only 0 DWORDs"), and
+  // dl_rx_fc_update_test saw 39 of 40 MWr. MPS is fixed here, and an empty
+  // TLP_m is reported instead of being sent.
   task body();
     bit [31:0] addr;
     if (device_cfg.is_rc) begin
       for (int i = 0; i < num_mwr; i++) begin
         addr = 32'h1000 + (i * 16);
-        `uvm_do_with(req, {req.pkt_type == 2;             //memory write
-                           req.header_mem.typef == 0;
-                           req.header_mem.fmt == 2;
-                           req.header_mem.td == 0;
-                           req.header_mem.tc == 0;
-                           req.header_mem.address1 == addr;
-                           req.header_mem.len == 3;
-                           req.payload_m.size() == req.header_mem.len;})
+        `uvm_create(req)
+        if (!req.randomize() with {pkt_type == 2;             //memory write
+                                   header_mem.typef == 0;
+                                   header_mem.fmt == 2;
+                                   header_mem.td == 0;
+                                   header_mem.tc == 0;
+                                   header_mem.address1 == addr;
+                                   header_mem.len == 3;
+                                   payload_m.size() == header_mem.len;
+                                   MPS == 128;})
+          `uvm_error("DL_MWR_SEQ", $sformatf("MWr %0d (address 'h%0h): randomization failed", i, addr))
+        if (req.TLP_m.size() == 0)
+          `uvm_error("DL_MWR_SEQ", $sformatf("MWr %0d (address 'h%0h): TL item built an empty TLP_m (MPS=%0d len=%0d)",
+                                             i, addr, req.MPS, req.header_mem.len))
+        `uvm_send(req)
       end
     end
   endtask
