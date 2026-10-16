@@ -1,5 +1,5 @@
 /////////////////////////////////////L2 sequence////////////////
-class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
+class siv_ltssm_seq_L2 extends siv_ltssm_seq;
   `uvm_object_utils(siv_ltssm_seq_L2)
 
   virtual siv_ltssm_intf pl_intf;
@@ -25,6 +25,7 @@ class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
       `uvm_fatal("CFG_ERR", "Failed to get device configuration from driver")
     end
     //pl_cfg.l0s_entry_enable=1;pl_cfg.aspm_l0s_support=1;
+    uvm_config_db#(bit)::set(null,"*","PL_SEQ_STATUS",0);
   endtask
 
   task body();
@@ -482,6 +483,10 @@ class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
       @(posedge pl_intf.clk);
     end
   endtask
+ task post_body();
+repeat(1)@(posedge pl_intf.clk);
+                uvm_config_db#(bit)::set(null,"*","PL_SEQ_STATUS",1);
+endtask
 endclass
 
 

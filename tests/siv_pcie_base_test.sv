@@ -80,8 +80,8 @@ class siv_pcie_base_test extends uvm_test;
     ep_dl_seq = dlcmsm_seq::type_id::create("ep_dl_seq", this);
 
     fork
-     // rc_dl_seq.start(env.rc_agent.dl_agent.sequencer);
-      //ep_dl_seq.start(env.ep_agent.dl_agent.sequencer);
+      rc_dl_seq.start(env.rc_agent.dl_agent.sequencer);
+     ep_dl_seq.start(env.ep_agent.dl_agent.sequencer);
     join
 
   endtask
