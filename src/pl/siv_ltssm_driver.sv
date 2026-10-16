@@ -348,7 +348,7 @@ task ltssm_rx();
 
       if (symbol_count == 4) begin
         adv_data_rate = os_buffer[symbol_count][5:1];
-        speed_change  = os_buffer[symbol_count][7];
+       // speed_change  = os_buffer[symbol_count][7];
       end
 
       if (symbol_count == 16) begin
@@ -358,6 +358,9 @@ task ltssm_rx();
 
         if (is_ts1) begin
           state_machine.ts1_rcvd_cnt++;
+	  if(os_buffer[4][7]==1)
+		 speed_change  = 1;
+          
           if (req.symbols[5][7])
             hr_count++;
           else
@@ -409,11 +412,11 @@ task ltssm_rx();
         else if (is_idle &&
                  (os_buffer[0] == 8'h00 && os_buffer[15] == 8'h00)) begin
           state_machine.idle_rcvd_cnt++;
-          `uvm_info("RX_IDLE",
+          /*`uvm_info("RX_IDLE",
                     $sformatf("[%s] Received IDLE (Total: %0d)",
                               pl_cfg.inst_name,
                               state_machine.idle_rcvd_cnt),
-                    UVM_MEDIUM)
+                    UVM_MEDIUM)*/
           is_idle = 0;
         end
         else if (is_eios &&

@@ -113,7 +113,11 @@ class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
             else
               begin 
                 `uvm_info("SIV_PCIE_SEQ", $sformatf("RC is in L0 active state"), UVM_MEDIUM) 
-                break;
+                //break;
+	if(`SIV_LINK_UP(ltssm_rc_state)==1)
+			begin
+			#1000; break;
+			end
               end
             
           end
@@ -325,7 +329,11 @@ class siv_ltssm_seq_L2 extends uvm_sequence #(siv_ltssm_seq_item);
               else
               begin 
                 `uvm_info("SIV_PCIE_SEQ", $sformatf("EP is in L0 active state"), UVM_MEDIUM) 
-                break;
+                //break;
+		if(`SIV_LINK_UP(ltssm_ep_state)==1)
+			begin
+			#1000; break;
+			end
               end
            end
           

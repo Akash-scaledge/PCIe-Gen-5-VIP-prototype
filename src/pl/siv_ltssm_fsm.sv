@@ -70,34 +70,34 @@ class siv_ltssm_fsm;
   
 
   function void reset_count_timer();
-   fts_tran_cnt = 0; // Number of FTS ordered sets transmitted
-   fts_rcvd_cnt = 0; // Number of FTS ordered sets received
+   this.fts_tran_cnt = 0; // Number of FTS ordered sets transmitted
+   this.fts_rcvd_cnt = 0; // Number of FTS ordered sets received
   
   // TS1/TS2 Training Sequence counters
-   ts1_rcvd_cnt = 0;  // Number of TS1 ordered sets received
-   ts2_rcvd_cnt = 0;  // Number of TS2 ordered sets received
-   ts1_tran_cnt = 0;  // Number of TS1 ordered sets transmitted
-   ts2_tran_cnt = 0;  // Number of TS2 ordered sets transmitted
+   this.ts1_rcvd_cnt = 0;  // Number of TS1 ordered sets received
+   this.ts2_rcvd_cnt = 0;  // Number of TS2 ordered sets received
+   this.ts1_tran_cnt = 0;  // Number of TS1 ordered sets transmitted
+   this.ts2_tran_cnt = 0;  // Number of TS2 ordered sets transmitted
   
   // Idle symbol counters
-     idle_rcvd_cnt = 0; // Number of IDLE ordered sets received
-     idle_tran_cnt = 0; // Number of IDLE ordered sets transmitted
+     this.idle_rcvd_cnt = 0; // Number of IDLE ordered sets received
+     this.idle_tran_cnt = 0; // Number of IDLE ordered sets transmitted
   
   // Electrical Idle Ordered Set counter
-   eios_tran_cnt = 0; // Number of EIOS ordered sets transmitted (enter electrical idle)
-   eie_tran_cnt = 0;  // Number of EIEOS ordered sets transmitted (exit electrical idle)
-   eios_rcvd_cnt = 0; // Number of EIOS ordered sets received
-   eie_rcvd_cnt = 0;  // Number of EIEOS ordered sets received
+   this.eios_tran_cnt = 0; // Number of EIOS ordered sets transmitted (enter electrical idle)
+   this.eie_tran_cnt = 0;  // Number of EIEOS ordered sets transmitted (exit electrical idle)
+   this.eios_rcvd_cnt = 0; // Number of EIOS ordered sets received
+   this.eie_rcvd_cnt = 0;  // Number of EIEOS ordered sets received
  
   // SKP (Skip) Ordered Set counters
-   skp_tran_cnt = 0; // Number of SKP ordered sets transmitted
-   skp_rcvd_cnt = 0; // Number of SKP ordered sets received
+   this.skp_tran_cnt = 0; // Number of SKP ordered sets transmitted
+   this.skp_rcvd_cnt = 0; // Number of SKP ordered sets received
  
   // SDS (Start of data stream) counters
-   sds_tran_cnt = 0; // Number of SDS ordered sets transmitted
-   sds_rcvd_cnt = 0; // Number of SDS ordered sets received
+   this.sds_tran_cnt = 0; // Number of SDS ordered sets transmitted
+   this.sds_rcvd_cnt = 0; // Number of SDS ordered sets received
   // Control Flags
-   timer_active=0;
+   this.timer_active=0;
 endfunction
 
   function int get_next_eq_speed(int cur_speed,int final_speed);
@@ -130,11 +130,20 @@ endfunction
          - Same behavior for RC and EP*/
       //------------------------------------------------
       DETECT_QUIET: begin
-       directed_speed_change = 0;
-       cur_data_rate = `SPEED_2_5_GTS;
+       directed_speed_change = 0; speed_change=0;
+        cur_data_rate = `SPEED_2_5_GTS; 
+        com_data_rate= `SPEED_2_5_GTS;
+	equalization_done_8GT_data_rate=0; 
+	equalization_done_16GT_data_rate=0; 
+	equalization_done_32GT_data_rate=0;
+	no_eq_done=0;
+        successful_speed_negotiation = 0;
+	changed_speed_recovery = 0;
+	start_equalization_w_preset = 0;
+	original_data_rate =cur_data_rate;
        previous_state = DETECT_QUIET;
        if (!timer_active) begin
-         state_timer.start_timer(LTSSM_12MS, pl_cfg.inst_name);
+         state_timer.start_timer(LTSSM_12MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
          timer_active = 1;
          `uvm_info("FSM", $sformatf("[%s] 12ms Timer started", pl_cfg.inst_name), UVM_MEDIUM)
        end
@@ -148,7 +157,7 @@ endfunction
          ltssm_ep_state = current_state;
          //timer_active = 0;
      	  reset_count_timer();
-
+        $display("Timer expired=%0d in detect",timer_active);
         `uvm_info("FSM", $sformatf("[%s] -> DETECT_ACTIVE", pl_cfg.inst_name), UVM_LOW)
       end
       
@@ -162,7 +171,7 @@ endfunction
        DETECT_ACTIVE: begin
         previous_state = DETECT_ACTIVE;
         if (!timer_active) begin
-          state_timer.start_timer(LTSSM_12MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_12MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         wait(state_timer.timer_expired);
@@ -173,7 +182,8 @@ endfunction
         else
           ltssm_ep_state = current_state;
         //timer_active = 0; 
-          reset_count_timer();
+          reset_count_timer();$display("Timer expired=%0d in detect",timer_active);
+
         `uvm_info("FSM", $sformatf("[%s] -> POLLING_ACTIVE", pl_cfg.inst_name), UVM_LOW)
       end
       
@@ -203,12 +213,13 @@ endfunction
 //           if (ts1_tran_cnt == `TS_1024+1) begin
           //ts1_rcvd_cnt = 0;
           //ts1_tran_cnt = 0;
-		reset_count_timer();
+		reset_count_timer();$display("Timer expired=%0d in detect",timer_active);
+
 //           end
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_12MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_12MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -258,7 +269,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_48MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_48MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1; 
         end
         // Timeout case
@@ -323,7 +334,7 @@ endfunction
         end
             // Start timer if not active FOR NORMAL CASE
          else if (!timer_active  && !link_disable) begin
-          state_timer.start_timer(pl_cfg.is_rc ? LTSSM_2MS : LTSSM_2MS,pl_cfg.inst_name);
+          state_timer.start_timer(pl_cfg.is_rc ? LTSSM_2MS : LTSSM_2MS,$sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -339,7 +350,7 @@ endfunction
          
         // Start timer if not active FOR DISABLE STATE TRANSTIONING
          else if (!timer_active  && link_disable) begin
-           state_timer.start_timer(pl_cfg.is_rc ? LTSSM_48MS : LTSSM_48MS,pl_cfg.inst_name);
+           state_timer.start_timer(pl_cfg.is_rc ? LTSSM_48MS : LTSSM_48MS,$sformatf("%s in %s",pl_cfg.inst_name,previous_state));
            $display("^&&&^");
           timer_active = 1;
         end
@@ -383,7 +394,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_2MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_2MS,$sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -424,7 +435,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_2MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_2MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -465,7 +476,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_2MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_2MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -518,7 +529,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_2MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_2MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -559,7 +570,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_2MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_2MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -592,6 +603,7 @@ endfunction
           if (pl_cfg.is_rc) ltssm_rc_state = current_state;
           else ltssm_ep_state = current_state;
           `uvm_info("FSM", $sformatf("[%s] -> RECOVERY_RCVRLOCK(Speed Negotiation)", pl_cfg.inst_name), UVM_LOW)
+		reset_count_timer();
         end
          else if(pl_cfg.l0s_entry_enable && pl_cfg.aspm_l0s_support && eios_rcvd_cnt>0) begin
                     previous_state =  L0;
@@ -614,6 +626,7 @@ endfunction
                     if (pl_cfg.is_rc) ltssm_rc_state = next_state;
                     else ltssm_ep_state = next_state;
                     `uvm_info("FSM", $sformatf("[%s] -> L1_ENTRY", pl_cfg.inst_name), UVM_LOW)
+			reset_count_timer();
       end
          //L2
          else if (pl_cfg.l2_entry_enable && eios_rcvd_cnt>0) begin
@@ -625,6 +638,7 @@ endfunction
           if (pl_cfg.is_rc) ltssm_rc_state = next_state;
           else ltssm_ep_state = next_state;
           `uvm_info("FSM", $sformatf("[%s] -> L2_IDLE", pl_cfg.inst_name), UVM_LOW)
+		reset_count_timer();
         end
          
          else
@@ -646,6 +660,14 @@ endfunction
         ltssm_state_e next_state;
         previous_state = RECOVERY_RCVRLOCK;
         successful_speed_negotiation = 0;
+
+    if (speed_change == 0 && directed_speed_change == 1 && 
+            com_data_rate > cur_data_rate && !no_eq_done) begin
+          speed_change = 1;
+          `uvm_info("FSM", $sformatf(
+            "[%s] RCVRLOCK: auto-asserting speed_change (com=%0d > cur=%0d)",
+            pl_cfg.inst_name, com_data_rate, cur_data_rate), UVM_LOW)
+        end           
 
 
         if (cur_data_rate >= `SPEED_8_GTS && cur_data_rate <= `SPEED_32_GTS) begin
@@ -706,8 +728,9 @@ endfunction
               else ltssm_ep_state = next_state;
               `uvm_info("FSM", $sformatf("[%s] RC skipping Phase 0 -> PHASE_1", 
                                          pl_cfg.inst_name), UVM_MEDIUM);
-              ts1_rcvd_cnt = 0;
-              ts1_tran_cnt = 0;
+              //ts1_rcvd_cnt = 0;
+              //ts1_tran_cnt = 0;
+		reset_count_timer();
             end
             // EP follows normal flow (Phase 0->1->2->3)
             else if (!pl_cfg.is_rc && start_equalization_w_preset && 
@@ -763,7 +786,7 @@ endfunction
 
         // Timer and timeout handling
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_24MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_24MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
           `uvm_info("FSM", $sformatf("[%s] RECOVERY_RCVRLOCK: Timer started (24ms)", 
                                      pl_cfg.inst_name), UVM_MEDIUM);
@@ -819,7 +842,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_24MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_24MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -855,7 +878,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_24MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_24MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -909,7 +932,7 @@ endfunction
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_24MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_24MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         // Timeout case
@@ -964,10 +987,11 @@ endfunction
                                      pl_cfg.inst_name), UVM_LOW);
           ts1_tran_cnt = 0;
           ts1_rcvd_cnt = 0;
+		reset_count_timer();
         end
         // Timer fallback (safety)
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_24MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_24MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
         end
         else if (state_timer.timer_expired) begin
@@ -977,6 +1001,7 @@ endfunction
           if (pl_cfg.is_rc) ltssm_rc_state = next_state;
           else ltssm_ep_state = next_state;
           timer_active = 0;
+		reset_count_timer();
           `uvm_error("FSM", $sformatf("[%s] EQ_PHASE_3 Timeout -> RECOVERY_SPEED", 
                                       pl_cfg.inst_name));
         end
@@ -993,9 +1018,20 @@ endfunction
         ltssm_state_e next_state; 
         previous_state = RECOVERY_RCFG;
         start_equalization_w_preset = 0;
+`uvm_info("FSM", $sformatf(
+          "[%s] RCFG ENTRY: ts2_t=%0d ts2_r=%0d speed_change=%0b dir_speed=%0b eq8=%0b eq16=%0b eq32=%0b com=%0d cur=%0d no_eq_done=%0b",
+          pl_cfg.inst_name, ts2_tran_cnt, ts2_rcvd_cnt, speed_change, directed_speed_change,
+          equalization_done_8GT_data_rate, equalization_done_16GT_data_rate,
+          equalization_done_32GT_data_rate, com_data_rate, cur_data_rate, no_eq_done), UVM_LOW)
+ if (speed_change == 0 && directed_speed_change == 1 && 
+            com_data_rate > cur_data_rate && !no_eq_done) begin
+          speed_change = 1;
+          `uvm_info("FSM", $sformatf(
+            "[%s] RCVRLOCK: auto-asserting speed_change (com=%0d > cur=%0d)",
+            pl_cfg.inst_name, com_data_rate, cur_data_rate), UVM_LOW)
+        end
 
-
-        if (directed_speed_change == 0 && !no_eq_done) begin
+        if (speed_change==1 && directed_speed_change == 0 && !no_eq_done) begin
           directed_speed_change = speed_change;
         end
 
@@ -1014,7 +1050,7 @@ endfunction
           speed_change = 0;
           ts2_tran_cnt = 0;
           ts2_rcvd_cnt = 0;
-
+		reset_count_timer();
           `uvm_info("FSM", $sformatf("[%s] -> RECOVERY_IDLE (Ready for L0)", pl_cfg.inst_name), UVM_LOW);
         end
         // Speed change case
@@ -1022,7 +1058,8 @@ endfunction
                  (speed_change == 1))begin
           $display("####################################################");
           previous_state = RECOVERY_RCFG;
-          next_state = RECOVERY_SPEED;
+          next_state = RECOVERY_SPEED;reset_count_timer();
+
           current_state = next_state;
           if (pl_cfg.is_rc) ltssm_rc_state = next_state;
           else ltssm_ep_state = next_state;         
@@ -1034,8 +1071,27 @@ endfunction
           end
           `uvm_info("FSM", $sformatf("[%s] -> RECOVERY_SPEED (Speed Switch)", pl_cfg.inst_name), UVM_LOW)
           ts2_tran_cnt = 0;
-          ts2_rcvd_cnt = 0;
+          ts2_rcvd_cnt = 0;reset_count_timer();
         end 
+        else if (ts2_tran_cnt >= 2 && ts2_rcvd_cnt >= 2 && 
+                 speed_change == 0 && 
+                 directed_speed_change == 0 &&
+                 !start_equalization_w_preset &&
+                 !equalization_done_8GT_data_rate && 
+                 !equalization_done_16GT_data_rate && 
+                 !equalization_done_32GT_data_rate) begin
+          previous_state = RECOVERY_RCFG;
+          next_state = RECOVERY_IDLE;
+          current_state = next_state;
+          if (pl_cfg.is_rc) ltssm_rc_state = next_state;
+          else ltssm_ep_state = next_state;
+          `uvm_info("FSM", $sformatf(
+            "[%s] -> RECOVERY_IDLE (Retrain no-op: no speed change, no EQ)",
+            pl_cfg.inst_name), UVM_LOW)
+          ts2_tran_cnt = 0;
+          ts2_rcvd_cnt = 0;
+          reset_count_timer();
+        end
         // Normal transition to IDLE
         else if (ts2_tran_cnt >= 16 && ts2_rcvd_cnt >= 8 && 
                  (speed_change == 0 || (cur_data_rate == `SPEED_2_5_GTS || cur_data_rate == `SPEED_8_GTS || cur_data_rate == `SPEED_16_GTS || cur_data_rate == `SPEED_32_GTS ))) begin
@@ -1048,11 +1104,11 @@ endfunction
           directed_speed_change = 0;
           `uvm_info("FSM", $sformatf("[%s] -> RECOVERY_IDLE (TS2 Count met)", pl_cfg.inst_name), UVM_LOW)
           ts2_tran_cnt = 0;
-          ts2_rcvd_cnt = 0;
+          ts2_rcvd_cnt = 0;reset_count_timer();
         end
         // Start timer if not active
         else if (!timer_active) begin
-          state_timer.start_timer(LTSSM_48MS, pl_cfg.inst_name);
+          state_timer.start_timer(LTSSM_48MS, $sformatf("%s in %s",pl_cfg.inst_name,previous_state));
           timer_active = 1;
           `uvm_info("FSM", $sformatf("[%s] RECOVERY_RCFG: Timer started (48ms)", pl_cfg.inst_name), UVM_MEDIUM)
         end
@@ -1065,7 +1121,7 @@ endfunction
             if (pl_cfg.is_rc) ltssm_rc_state = next_state;
             else ltssm_ep_state = next_state;
             ts2_tran_cnt = 0;
-            ts2_rcvd_cnt = 0;
+            ts2_rcvd_cnt = 0;reset_count_timer();
           end 
           else if (cur_data_rate == `SPEED_8_GTS) begin
             next_state = RECOVERY_IDLE;
@@ -1075,7 +1131,7 @@ endfunction
             changed_speed_recovery = 0;
             directed_speed_change = 0;
             ts2_tran_cnt = 0;
-            ts2_rcvd_cnt = 0;
+            ts2_rcvd_cnt = 0;reset_count_timer();
           end
           else begin
             next_state = DETECT_QUIET;
@@ -1083,7 +1139,7 @@ endfunction
             if (pl_cfg.is_rc) ltssm_rc_state = next_state;
             else ltssm_ep_state = next_state;
             ts2_tran_cnt = 0;
-            ts2_rcvd_cnt = 0;
+            ts2_rcvd_cnt = 0;reset_count_timer();
           end
         end
       end
@@ -1444,6 +1500,17 @@ endfunction
              // timer_active = 0;
              // eie_rcvd_cnt=0;
                reset_count_timer();
+		 directed_speed_change = 0;speed_change=0;
+        cur_data_rate = `SPEED_2_5_GTS; 
+        com_data_rate= `SPEED_2_5_GTS;
+	equalization_done_8GT_data_rate=0; 
+	equalization_done_16GT_data_rate=0; 
+	equalization_done_32GT_data_rate=0;
+	no_eq_done=0;
+        successful_speed_negotiation = 0;
+	changed_speed_recovery = 0;
+	start_equalization_w_preset = 0;
+	original_data_rate =cur_data_rate;
               `uvm_info("FSM",
                         $sformatf("[%s] L2_IDLE -> DETECT (Beacon detected/directed on DS)",
                                   pl_cfg.inst_name),UVM_LOW)
@@ -1501,7 +1568,17 @@ endfunction
           eie_rcvd_cnt    = 0;
           timer_active =0;*/
 		reset_count_timer();
-
+	 directed_speed_change = 0; speed_change=0;
+        cur_data_rate = `SPEED_2_5_GTS; 
+        com_data_rate= `SPEED_2_5_GTS;
+	equalization_done_8GT_data_rate=0; 
+	equalization_done_16GT_data_rate=0; 
+	equalization_done_32GT_data_rate=0;
+	no_eq_done=0;
+        successful_speed_negotiation = 0;
+	changed_speed_recovery = 0;
+	start_equalization_w_preset = 0;
+	original_data_rate =cur_data_rate;
           `uvm_info("FSM",
                     $sformatf("[%s] L2_TRANSMITWAKE -> DETECT (Electrical Idle Exit)",
                               pl_cfg.inst_name),UVM_LOW)

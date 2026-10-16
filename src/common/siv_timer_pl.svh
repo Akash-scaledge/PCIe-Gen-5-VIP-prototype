@@ -7,15 +7,16 @@
 // - Fork/join_none based non-blocking implementation
 // - Debug logging with UVM messaging
 // import uvm_pkg::*;
-
+ 
 class siv_uvm_timer_pl extends uvm_object;
   `uvm_object_utils(siv_uvm_timer_pl)
-
+ 
   // Interface and Control Variables
   virtual siv_ltssm_intf      timer_interface;  // Virtual interface with clock
   bit                    timer_expired;    // Timer flag
   string                 timer_id;         // Identifier 
-
+  int unsigned           timer_gen;        // (1) Bumped by every start_timer; only the latest timer sets timer_expired
+ 
   // Constructor
   //   name - Instance name for UVM hierarchy
   function new(string name = "siv_uvm_timer");
@@ -23,7 +24,7 @@ class siv_uvm_timer_pl extends uvm_object;
     this.timer_expired = 0;
     this.timer_id = "";
   endfunction
-
+ 
   // Set Virtual Interface
   function void set_vif(virtual siv_ltssm_intf vif);
     this.timer_interface = vif;
@@ -32,47 +33,49 @@ class siv_uvm_timer_pl extends uvm_object;
              this.get_name()), 
              UVM_HIGH)
   endfunction
-
+ 
   // Start Timer Task
   //   delay_cycles - Number of clock cycles to wait
   //   timer_name   - Identifier 
   //
   // Description:
   //   Starts non-blocking timer that will set done_flag after
-  //   specified number of clock cycles
+  //   specified number of clock cycles. Starting a new timer replaces
+  //   the running one: the old countdown no longer sets timer_expired.
   task start_timer(int delay_cycles, string timer_name);
     // Initialize timer state
     this.timer_expired = 0;
     this.timer_id = timer_name;
-    
+    this.timer_gen++;                                  // (2) this is now the latest timer
     `uvm_info("TIMER_START", 
              $sformatf("[%s] Starting %0d cycle timer", 
              timer_id, delay_cycles), 
              UVM_MEDIUM)
-
+ 
     fork
       begin
         automatic int cycles_remaining = delay_cycles;
-        
+        automatic int unsigned my_gen = timer_gen;     // (3) remember which timer this countdown is
         // Count down clock cycles
         while (cycles_remaining > 0) begin
           @(posedge timer_interface.clk);
           cycles_remaining--;
         end
-        
-        // Timer completion
-        this.timer_expired = 1;
-        `uvm_info("TIMER_DONE", 
-                 $sformatf("[%s] Timer completed after %0d cycles", 
-                 timer_id, delay_cycles), 
-                 UVM_MEDIUM)
+        // Timer completion (only if no newer timer was started)
+        if (my_gen == timer_gen) begin                 // (3) a replaced timer finishes silently
+          this.timer_expired = 1;
+          `uvm_info("TIMER_DONE", 
+                   $sformatf("[%s] Timer completed after %0d cycles", 
+                   timer_id, delay_cycles), 
+                   UVM_MEDIUM)
+        end
       end
     join_none
   endtask
-
+ 
   //   Current expiration status of the timer
   function bit is_done();
     return timer_expired;
   endfunction
-
+ 
 endclass
